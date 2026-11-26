@@ -26,6 +26,7 @@ use support::*;
 const CHILD: &str = "SELENE_CHILD_BASE";
 const CHILD_POINT: &str = "SELENE_CHILD_POINT";
 const CHILD_DUMP: &str = "SELENE_CHILD_DUMP";
+const CHILD_NAME: &str = "SELENE_CHILD_NAME";
 const CHILD_QUARANTINE: &str = "SELENE_CHILD_QUARANTINE";
 
 /// Polls until the manager's entry for `tokens` is offered from `tier`.
@@ -535,7 +536,7 @@ fn l0_06_multiprocess_kill_recovery() {
             memory,
             64 * 1024 * 1024,
         );
-        config.name = instance_name("child");
+        config.name = std::env::var(CHILD_NAME).unwrap_or_else(|_| instance_name("child"));
         config.faults.pause_at = Some(point.clone());
         config.faults.signal = Some(base.join("gate"));
         if let Ok(dump) = std::env::var(CHILD_DUMP) {
@@ -588,16 +589,19 @@ fn l0_06_multiprocess_kill_recovery() {
     }
     for point in ["data", "before_rename", "after_rename", "parent_write"] {
         let base = base(point);
+        let child_name = instance_name(point);
         let config = Config::new(
             base.join("records"),
             base.join("run/m.sock"),
             4096,
             64 * 1024 * 1024,
         );
+        let _shm = ShmCleanup::new(&child_name, &config.socket);
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "l0_06_multiprocess_kill_recovery", "--nocapture"])
             .env(CHILD, &base)
             .env(CHILD_POINT, point)
+            .env(CHILD_NAME, &child_name)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -605,11 +609,10 @@ fn l0_06_multiprocess_kill_recovery() {
         wait(|| base.join("gate").exists());
         child.kill().unwrap();
         let status = child.wait().unwrap();
-        remove_children_shm(child.id());
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         let lock = disk::RootLock::acquire(&config.root.as_ref().unwrap().clone()).unwrap();
-        let recovered = recovered_keys(config.root.as_ref().unwrap());
+        let recovered = recovered_keys(config.root.as_ref().unwrap(), &child_name);
         assert_eq!(
             recovered,
             if point == "after_rename" {
@@ -638,6 +641,7 @@ fn l0_06_multiprocess_kill_recovery() {
             .args(["--exact", "l0_06_multiprocess_kill_recovery", "--nocapture"])
             .env(CHILD, &base)
             .env(CHILD_DUMP, &dump)
+            .env(CHILD_NAME, &child_name)
             .stdout(Stdio::null())
             .spawn()
             .unwrap();
@@ -661,7 +665,6 @@ fn l0_06_multiprocess_kill_recovery() {
         assert_eq!(snapshot.unwrap(), (recovered.len(), persisted));
         restarted.kill().unwrap();
         restarted.wait().unwrap();
-        remove_children_shm(restarted.id());
         fs::remove_dir_all(base).unwrap();
     }
 }

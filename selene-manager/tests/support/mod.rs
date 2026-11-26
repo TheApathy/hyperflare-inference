@@ -203,8 +203,8 @@ pub fn content_with_payload(
     (header, bytes, hashes)
 }
 
-pub fn recovered_keys(root: &Path) -> Vec<Key> {
-    selene_manager::disk::recover(root, "")
+pub fn recovered_keys(root: &Path, pool_name: &str) -> Vec<Key> {
+    selene_manager::disk::recover(root, pool_name)
         .unwrap()
         .iter()
         .flat_map(|namespace| namespace.records.iter().map(|(header, _, _)| header.key))

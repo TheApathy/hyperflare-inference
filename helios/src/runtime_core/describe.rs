@@ -750,6 +750,15 @@ fn payload_rank_json(
             }))
         })
         .collect();
+    let rebuild_weights = match crate::core::prepared_weights::catalog(body)? {
+        None => Value::Null,
+        Some(catalog) if options.all => json!(catalog.as_ref()),
+        Some(catalog) => json!({
+            "version": catalog.version,
+            "tensors": catalog.views.len(),
+            "unavailable": catalog.unavailable.len(),
+        }),
+    };
     let execution = core.execution.as_ref();
     let mut value = json!({
         "rank": body.rank,
@@ -785,7 +794,7 @@ fn payload_rank_json(
             "world": r.world, "rank": r.rank, "proxy_abi": r.proxy_abi,
             "region_bytes": r.region_bytes, "varlen_bytes": r.varlen_bytes,
         })),
-        "rebuild_weights": Value::Null,
+        "rebuild_weights": rebuild_weights,
     });
     if !options.graphs && !options.all {
         value.as_object_mut().unwrap().remove("execution_graphs");
@@ -1200,5 +1209,143 @@ mod tests {
         assert_eq!(frontend["prompt_encoder"], "DEEPSEEK_V41");
         assert_eq!(frontend["image_placeholder_token_id"], 7);
         assert!(frontend["tools"].is_null());
+    }
+
+    #[test]
+    fn payload_cores_report_per_rank_rebuild_weights_inline_and_compressed() {
+        let empty_core = || Core {
+            resources: Default::default(),
+            architecture: [12, 0],
+            allocations: vec![],
+            modules: vec![],
+            functions: vec![],
+            graphs: vec![],
+            reservations: vec![],
+            execution: None,
+            context: Default::default(),
+            events: vec![],
+        };
+        let core_body = pwire::CoreBody {
+            frontend: Some(wire::FrontendSettings::default()),
+            sampling_defaults: Some(wire::DefaultSamplingParameters::default()),
+            ..Default::default()
+        };
+        let deployment = pwire::DeploymentBody {
+            architecture: vec![12, 0],
+            contract: Some(wire::ServingContract {
+                model_contract: Some(wire::ModelContract::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let locations = pwire::LocationSet::default();
+
+        // 1. Absent prepared-weight catalog reports null.
+        let absent_rank = pwire::RankBody {
+            rank: 0,
+            ..Default::default()
+        };
+        let absent = describe_payload(
+            &core_body,
+            &deployment,
+            &[absent_rank],
+            &[empty_core()],
+            &locations,
+            InspectionOptions::default(),
+        )
+        .unwrap();
+        assert!(absent["ranks"][0]["rebuild_weights"].is_null());
+
+        // 2. Build a catalog with multiple views and unavailable entries so zstd compaction
+        //    shrinks it, and compare against a logical-resource index with the same counts.
+        let views: Vec<pwire::PreparedWeightView> = (0..16)
+            .map(|i| pwire::PreparedWeightView {
+                name: format!("model.layers.{i}.mlp.gate_proj.weight"),
+                group: format!("layer.{i}"),
+                dtype: "bfloat16".into(),
+                element_bytes: 2,
+                shape: vec![4096, 4096],
+                stride: vec![4096, 1],
+                layout_type: "dense".into(),
+                allocation: 0,
+                offset: i * 1024,
+                nbytes: 1024,
+                ..Default::default()
+            })
+            .collect();
+        let unavailable = vec!["lm_head.weight".into(), "embed_tokens.weight".into()];
+        let catalog = pwire::PreparedWeightCatalog {
+            version: 2,
+            views,
+            unavailable: unavailable.clone(),
+        };
+        let inline_rank = pwire::RankBody {
+            rank: 0,
+            prepared_weights: Some(catalog.clone()),
+            ..Default::default()
+        };
+        let mut compressed_rank = inline_rank.clone();
+        crate::core::prepared_weights::compact(&mut compressed_rank).unwrap();
+        assert!(
+            compressed_rank.prepared_weights.is_none()
+                && compressed_rank.compressed_prepared_weights.is_some(),
+            "expected catalog to compact into compressed_prepared_weights"
+        );
+
+        let logical_index = wire::ModelIndex {
+            contract: deployment.contract.clone(),
+            frontend: core_body.frontend.clone(),
+            sampling_defaults: core_body.sampling_defaults,
+            ranks: vec![wire::BundleIndex {
+                rebuild_weights: Some(wire::RebuildWeights {
+                    version: 2,
+                    tensors: (0..16)
+                        .map(|i| wire::RebuildTensor {
+                            name: format!("model.layers.{i}.mlp.gate_proj.weight"),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    unavailable,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let logical_summary =
+            describe_index(&logical_index, InspectionOptions::default(), None).unwrap();
+
+        for rank_body in [&inline_rank, &compressed_rank] {
+            let summary = describe_payload(
+                &core_body,
+                &deployment,
+                std::slice::from_ref(rank_body),
+                &[empty_core()],
+                &locations,
+                InspectionOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                summary["ranks"][0]["rebuild_weights"],
+                logical_summary["ranks"][0]["rebuild_weights"]
+            );
+            assert_eq!(
+                summary["ranks"][0]["rebuild_weights"],
+                json!({"version": 2, "tensors": 16, "unavailable": 2})
+            );
+
+            let full = describe_payload(
+                &core_body,
+                &deployment,
+                std::slice::from_ref(rank_body),
+                &[empty_core()],
+                &locations,
+                InspectionOptions {
+                    all: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(full["ranks"][0]["rebuild_weights"], json!(&catalog));
+        }
     }
 }

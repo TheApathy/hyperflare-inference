@@ -48,7 +48,7 @@ if [[ ! "$version" =~ ^[0-9][A-Za-z0-9.+:~\-]*$ ]]; then
     printf 'Invalid Debian package version.\n' >&2
     exit 2
 fi
-if ! git -C "$root" diff --quiet HEAD -- flare helios eos selene selene-manager; then
+if ! git -C "$root" diff --quiet HEAD -- flare flare-cli helios eos selene selene-manager; then
     printf 'Commit native source changes before building a release package.\n' >&2
     exit 1
 fi

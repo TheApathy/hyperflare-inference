@@ -255,6 +255,9 @@ mod imp {
         h_meta: PinnedHost,
         h_scalars: PinnedHost,
         h_batch_meta: PinnedHost,
+        span_dsts: Vec<u64>,
+        span_srcs: Vec<u64>,
+        span_lens: Vec<u64>,
         max_spans: usize,
         max_chunks: usize,
         max_lanes: usize,
@@ -401,6 +404,9 @@ mod imp {
                 h_meta,
                 h_scalars: stream.mapped_host_buffer(64).map_err(io_err)?,
                 h_batch_meta: stream.mapped_host_buffer(BATCH_META_BYTES).map_err(io_err)?,
+                span_dsts: Vec::with_capacity(max_spans),
+                span_srcs: Vec::with_capacity(max_spans),
+                span_lens: Vec::with_capacity(max_spans),
                 max_spans,
                 max_chunks,
                 max_lanes,
@@ -450,21 +456,21 @@ mod imp {
                 unsafe { stream.memset_d8_async(base, 0, n).map_err(io_err)? };
             }
             if spans.len() > 1 {
-                let mut dsts = Vec::with_capacity(spans.len());
-                let mut srcs = Vec::with_capacity(spans.len());
-                let mut lens = Vec::with_capacity(spans.len());
+                self.span_dsts.clear();
+                self.span_srcs.clear();
+                self.span_lens.clear();
                 for s in spans {
                     if s.offset.checked_add(s.length).is_none_or(|e| e > n) {
                         return Err(invalid("GPU span exceeds unit size"));
                     }
                     if s.length > 0 {
                         let staged = base + s.offset as u64;
-                        dsts.push(if gather { staged } else { s.device });
-                        srcs.push(if gather { s.device } else { staged });
-                        lens.push(s.length as u64);
+                        self.span_dsts.push(if gather { staged } else { s.device });
+                        self.span_srcs.push(if gather { s.device } else { staged });
+                        self.span_lens.push(s.length as u64);
                     }
                 }
-                let count = dsts.len();
+                let count = self.span_dsts.len();
                 if count == 0 {
                     return Ok(());
                 }
@@ -476,9 +482,9 @@ mod imp {
                 }
                 let stride = count * 8;
                 let meta = self.h_meta.bytes_mut();
-                write_u64s(&mut meta[0..stride], &dsts);
-                write_u64s(&mut meta[stride..stride * 2], &srcs);
-                write_u64s(&mut meta[stride * 2..stride * 3], &lens);
+                write_u64s(&mut meta[0..stride], &self.span_dsts);
+                write_u64s(&mut meta[stride..stride * 2], &self.span_srcs);
+                write_u64s(&mut meta[stride * 2..stride * 3], &self.span_lens);
                 let hptr = self.h_meta.address() as *const u8;
                 for (dev, off) in [
                     (self.d_copy_dst.ptr(), 0),
@@ -962,9 +968,6 @@ mod imp {
                 return Err(invalid("GPU decode plan exceeds codec workspace capacity"));
             }
 
-            if crc32_chunks(chunks) != stored_crc {
-                return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
-            }
             {
                 let dst = &mut self.h_pinned.bytes_mut()[..total];
                 let mut off = 0usize;
@@ -973,7 +976,17 @@ mod imp {
                     off += c.len();
                 }
             }
-            let hdr = plan.parse_packet_header(&self.h_pinned.bytes()[..total])?;
+            // Parse the header before uploading; if header parsing fails, fall back to CPU CRC32
+            // so corrupted header bytes still report `Checksum::Stored`.
+            let hdr = match plan.parse_packet_header(&self.h_pinned.bytes()[..total]) {
+                Ok(hdr) => hdr,
+                Err(err) => {
+                    if crc32_chunks(&[&self.h_pinned.bytes()[..total]]) != stored_crc {
+                        return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
+                    }
+                    return Err(err);
+                }
+            };
             let dp_idx = self.device_plan_index(plan)?;
 
             unsafe {
@@ -981,6 +994,17 @@ mod imp {
                     .copy_htod_async(self.buf_a.ptr(), self.h_pinned.address() as _, total)
                     .map_err(io_err)?;
             }
+
+            // Compute stored CRC32 on GPU (`buf_a[..total]` -> `d_scalars[12..16]`) while `buf_a`
+            // holds the uploaded packet, before decode stages overwrite `buf_a` with raw bytes.
+            self.launch_gpu_crc32(
+                self.buf_a.ptr(),
+                0,
+                total as u64,
+                0,
+                self.d_scalars.ptr() + 12,
+                stream,
+            )?;
 
             let off_ch_words = nc * 4;
             let off_lane_offs = nc * 8;
@@ -1144,7 +1168,9 @@ mod imp {
                 self.launch_non_matrix_transforms(plan, self.buf_a.ptr(), self.buf_c.ptr(), 1, stream)?;
             }
 
-            // 4. Verify `err_flag` and `original_crc` over `buf_a` BEFORE scattering into live GPU cache.
+            // 4. Verify `stored_crc`, `err_flag`, and `original_crc` over `buf_a` BEFORE scattering
+            //    into live GPU cache. Check `stored_crc` first so payload corruption reports
+            //    `Checksum::Stored` even if a decode kernel also set `err_flag`.
             let n = plan.original_bytes();
             self.launch_gpu_crc32(self.buf_a.ptr(), 0, n as u64, 0, self.d_scalars.ptr() + 8, stream)?;
             unsafe {
@@ -1159,7 +1185,11 @@ mod imp {
             sync_stream(stream, event)?;
             let sc = &self.h_scalars.bytes()[..20];
             let got_orig_crc = u32::from_le_bytes(sc[8..12].try_into().unwrap());
+            let got_stored_crc = u32::from_le_bytes(sc[12..16].try_into().unwrap());
             let err_val = u32::from_le_bytes(sc[16..20].try_into().unwrap());
+            if got_stored_crc != stored_crc {
+                return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
+            }
             if err_val != 0 {
                 return Err(invalid("invalid compressed payload in GKV1 packet"));
             }
@@ -1200,10 +1230,9 @@ mod imp {
                     }
                 }
             }
-            let total_est: usize = spans_per_page.iter().map(|s| s.len()).sum();
-            let mut dsts = Vec::with_capacity(total_est);
-            let mut srcs = Vec::with_capacity(total_est);
-            let mut lens = Vec::with_capacity(total_est);
+            self.span_dsts.clear();
+            self.span_srcs.clear();
+            self.span_lens.clear();
             for (p, spans) in spans_per_page.iter().enumerate() {
                 let page_base = base + (p * n) as u64;
                 for s in spans {
@@ -1212,13 +1241,13 @@ mod imp {
                     }
                     if s.length > 0 {
                         let staged = page_base + s.offset as u64;
-                        dsts.push(if gather { staged } else { s.device });
-                        srcs.push(if gather { s.device } else { staged });
-                        lens.push(s.length as u64);
+                        self.span_dsts.push(if gather { staged } else { s.device });
+                        self.span_srcs.push(if gather { s.device } else { staged });
+                        self.span_lens.push(s.length as u64);
                     }
                 }
             }
-            let count = dsts.len();
+            let count = self.span_dsts.len();
             if count == 0 {
                 return Ok(());
             }
@@ -1230,9 +1259,9 @@ mod imp {
             }
             let stride = count * 8;
             let meta = self.h_meta.bytes_mut();
-            write_u64s(&mut meta[0..stride], &dsts);
-            write_u64s(&mut meta[stride..stride * 2], &srcs);
-            write_u64s(&mut meta[stride * 2..stride * 3], &lens);
+            write_u64s(&mut meta[0..stride], &self.span_dsts);
+            write_u64s(&mut meta[stride..stride * 2], &self.span_srcs);
+            write_u64s(&mut meta[stride * 2..stride * 3], &self.span_lens);
             let hptr = self.h_meta.address() as *const u8;
             for (dev, off) in [
                 (self.d_copy_dst.ptr(), 0),
@@ -1720,39 +1749,59 @@ mod imp {
             }
             let dp_idx = self.device_plan_index(plan)?;
 
-            // 1. Verify stored CRC32 on CPU before touching PCIe/VRAM, copy all `batch` packets
-            //    contiguously into `h_pinned`, and parse packet headers.
-            let mut pkt_offs = Vec::with_capacity(batch);
-            let mut pkt_lens = Vec::with_capacity(batch);
+            // 1. Copy all `batch` packets contiguously into `h_pinned`, record offsets/lengths
+            //    directly in `h_batch_meta`, and parse packet headers. Stored CRC32 is verified
+            //    on GPU below; CPU CRC32 runs only on error branches so corrupt lengths or
+            //    headers still report `Checksum::Stored`.
             let mut parsed = Vec::with_capacity(batch);
             let mut total_bytes = 0usize;
-            for &(chunks, stored_crc, _) in packets {
-                if crc32_chunks(chunks) != stored_crc {
-                    return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
-                }
+            for (p, &(chunks, stored_crc, _)) in packets.iter().enumerate() {
                 let len: usize = chunks.iter().map(|c| c.len()).sum();
                 if len < plan.metadata_bytes() || len > plan.max_packet() {
+                    if packets[..=p]
+                        .iter()
+                        .any(|&(ch, expected, _)| crc32_chunks(ch) != expected)
+                    {
+                        return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
+                    }
                     return Err(invalid("invalid GKV1 packet length"));
                 }
-                pkt_offs.push(total_bytes as u64);
-                pkt_lens.push(len as u64);
-                let dst = &mut self.h_pinned.bytes_mut()[total_bytes..total_bytes + len];
-                let mut pos = 0usize;
-                for c in chunks {
-                    dst[pos..pos + c.len()].copy_from_slice(c);
-                    pos += c.len();
+                {
+                    let bm = self.h_batch_meta.bytes_mut();
+                    bm[BATCH_OFF_PKT_OFFS + p * 8..BATCH_OFF_PKT_OFFS + (p + 1) * 8]
+                        .copy_from_slice(&(total_bytes as u64).to_le_bytes());
+                    bm[BATCH_OFF_PKT_LENS + p * 8..BATCH_OFF_PKT_LENS + (p + 1) * 8]
+                        .copy_from_slice(&(len as u64).to_le_bytes());
                 }
-                parsed.push(plan.parse_packet_header(&self.h_pinned.bytes()[total_bytes..total_bytes + len])?);
+                {
+                    let dst = &mut self.h_pinned.bytes_mut()[total_bytes..total_bytes + len];
+                    let mut pos = 0usize;
+                    for c in chunks {
+                        dst[pos..pos + c.len()].copy_from_slice(c);
+                        pos += c.len();
+                    }
+                }
+                match plan.parse_packet_header(&self.h_pinned.bytes()[total_bytes..total_bytes + len]) {
+                    Ok(hdr) => parsed.push(hdr),
+                    Err(err) => {
+                        if crc32_chunks(&[&self.h_pinned.bytes()[total_bytes..total_bytes + len]])
+                            != stored_crc
+                            || packets[..p]
+                                .iter()
+                                .any(|&(ch, expected, _)| crc32_chunks(ch) != expected)
+                        {
+                            return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
+                        }
+                        return Err(err);
+                    }
+                }
                 total_bytes += len;
             }
-            {
-                let bm = self.h_batch_meta.bytes_mut();
-                write_u64s(&mut bm[BATCH_OFF_PKT_OFFS..BATCH_OFF_PKT_OFFS + batch * 8], &pkt_offs);
-                write_u64s(&mut bm[BATCH_OFF_PKT_LENS..BATCH_OFF_PKT_LENS + batch * 8], &pkt_lens);
-            }
 
-            // 2. Upload all verified packets (`buf_a`) + offsets/lens (`d_batch_meta`).
+            // 2. Upload all packets (`buf_a`) + offsets/lens (`d_batch_meta`) and compute stored
+            //    CRC32 for every packet on GPU before decode stages overwrite `buf_a`.
             let d_pkt_offs = self.d_batch_meta.ptr() + BATCH_OFF_PKT_OFFS as u64;
+            let d_pkt_lens = self.d_batch_meta.ptr() + BATCH_OFF_PKT_LENS as u64;
             unsafe {
                 stream
                     .copy_htod_async(self.buf_a.ptr(), self.h_pinned.address() as _, total_bytes)
@@ -1764,6 +1813,36 @@ mod imp {
                         BATCH_OFF_PKT_LENS + batch * 8,
                     )
                     .map_err(io_err)?;
+            }
+            {
+                let (mut base, mut offs, mut lens, mut fstride, mut flen, mut mlen, mut out, mut b) = (
+                    self.buf_a.ptr(),
+                    d_pkt_offs,
+                    d_pkt_lens,
+                    0u64,
+                    0u64,
+                    0u64,
+                    self.d_batch_meta.ptr() + BATCH_OFF_STORED_CRC as u64,
+                    batch as c_int,
+                );
+                launch_1d(
+                    bf.fn_crc32_batch,
+                    batch as u32,
+                    256,
+                    0,
+                    stream,
+                    &mut [
+                        &mut base as *mut _ as _,
+                        &mut offs as *mut _ as _,
+                        &mut lens as *mut _ as _,
+                        &mut fstride as *mut _ as _,
+                        &mut flen as *mut _ as _,
+                        &mut mlen as *mut _ as _,
+                        &mut out as *mut _ as _,
+                        &mut b as *mut _ as _,
+                    ],
+                    "launch(kv_crc32_batch_gpu:dec_stored)",
+                )?;
             }
 
             // Pack all `batch * nc` chunk directories into `h_meta`.
@@ -1915,7 +1994,8 @@ mod imp {
                 }
             }
 
-            // 5. Verify `err_flag` and all `batch` `original_crc` values BEFORE scattering to live VRAM.
+            // 5. Verify all `batch` `stored_crc` values, `err_flag`, and all `batch`
+            //    `original_crc` values BEFORE scattering to live VRAM.
             {
                 let (mut base, mut offs, mut lens, mut fstride, mut flen, mut mlen, mut out, mut b) = (
                     self.buf_a.ptr(),
@@ -1946,12 +2026,13 @@ mod imp {
                     "launch(kv_crc32_batch_gpu:dec_orig)",
                 )?;
             }
+            let crc_d2h_bytes = (BATCH_OFF_STORED_CRC - BATCH_OFF_ORIG_CRC) + batch * 4;
             unsafe {
                 stream
                     .copy_dtoh_async(
                         (self.h_batch_meta.address() + BATCH_OFF_ORIG_CRC) as _,
                         self.d_batch_meta.ptr() + BATCH_OFF_ORIG_CRC as u64,
-                        batch * 4,
+                        crc_d2h_bytes,
                     )
                     .map_err(io_err)?;
                 stream
@@ -1963,12 +2044,22 @@ mod imp {
                     .map_err(io_err)?;
             }
             sync_stream(stream, event)?;
+            let bm = self.h_batch_meta.bytes();
+            for (p, &(_, expected_stored_crc, _)) in packets.iter().enumerate() {
+                let got = u32::from_le_bytes(
+                    bm[BATCH_OFF_STORED_CRC + p * 4..BATCH_OFF_STORED_CRC + (p + 1) * 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                if got != expected_stored_crc {
+                    return Err(Error::new(ErrorKind::InvalidData, Checksum::Stored));
+                }
+            }
             let err_val =
                 u32::from_le_bytes(self.h_scalars.bytes()[16..20].try_into().unwrap());
             if err_val != 0 {
                 return Err(invalid("invalid compressed payload in GKV1 packet"));
             }
-            let bm = self.h_batch_meta.bytes();
             for (p, &(_, _, expected_orig_crc)) in packets.iter().enumerate() {
                 let got = u32::from_le_bytes(
                     bm[BATCH_OFF_ORIG_CRC + p * 4..BATCH_OFF_ORIG_CRC + (p + 1) * 4]
@@ -2120,7 +2211,8 @@ mod imp {
                 .unwrap();
             assert_eq!(cpu_out, src);
 
-            // Corrupted stored CRC rejected before touching dst
+            // Corrupted stored CRC (payload byte and header byte) and original CRC mismatch
+            // must all be rejected before touching dst.
             dst_mem.bytes_mut().fill(0x5A);
             let mut bad_pkt = pkt.clone();
             bad_pkt[pkt.len() / 2] ^= 0xFF;
@@ -2136,6 +2228,36 @@ mod imp {
                 )
                 .unwrap_err();
             assert!(err.to_string().contains("stored"));
+            assert!(dst_mem.bytes().iter().all(|&b| b == 0x5A));
+
+            let mut bad_hdr = pkt.clone();
+            bad_hdr[0] ^= 0xFF;
+            let err = codec
+                .decode_to_device(
+                    &gplan,
+                    &[&bad_hdr],
+                    &dst_spans,
+                    unit.stored_crc,
+                    unit.original_crc,
+                    &stream,
+                    &event,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("stored"));
+            assert!(dst_mem.bytes().iter().all(|&b| b == 0x5A));
+
+            let err = codec
+                .decode_to_device(
+                    &gplan,
+                    &[&pkt],
+                    &dst_spans,
+                    unit.stored_crc,
+                    unit.original_crc ^ 1,
+                    &stream,
+                    &event,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("original"));
             assert!(dst_mem.bytes().iter().all(|&b| b == 0x5A));
 
             // Incompressible random input falls back to Literal
@@ -2340,7 +2462,8 @@ mod imp {
                     &b_src.bytes()[p * p_total..(p + 1) * p_total]
                 );
             }
-            // Corrupting one packet in a batch must fail stored CRC before touching any destination.
+            // Corrupting a stored CRC, payload byte, header byte, or original CRC in a batch
+            // must fail with the matching checksum error before touching any destination.
             b_dst.bytes_mut().fill(0x5A);
             let mut bad_batch = comp_packets.clone();
             bad_batch[2].1 ^= 1;
@@ -2354,6 +2477,55 @@ mod imp {
                 )
                 .unwrap_err();
             assert!(err.to_string().contains("stored"));
+            assert!(b_dst.bytes().iter().all(|&b| b == 0x5A));
+
+            let mut bad_payload = comp_slices[2].to_vec();
+            let mid = bad_payload.len() / 2;
+            bad_payload[mid] ^= 0xFF;
+            let bad_payload_slice = bad_payload.as_slice();
+            let mut bad_payload_batch = comp_packets.clone();
+            bad_payload_batch[2].0 = std::slice::from_ref(&bad_payload_slice);
+            let err = bcodec
+                .decode_pages_batch_to_device(
+                    &p_gplan,
+                    &bad_payload_batch,
+                    &comp_dst_spans,
+                    &stream,
+                    &event,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("stored"));
+            assert!(b_dst.bytes().iter().all(|&b| b == 0x5A));
+
+            let mut bad_hdr = comp_slices[2].to_vec();
+            bad_hdr[0] ^= 0xFF;
+            let bad_hdr_slice = bad_hdr.as_slice();
+            let mut bad_hdr_batch = comp_packets.clone();
+            bad_hdr_batch[2].0 = std::slice::from_ref(&bad_hdr_slice);
+            let err = bcodec
+                .decode_pages_batch_to_device(
+                    &p_gplan,
+                    &bad_hdr_batch,
+                    &comp_dst_spans,
+                    &stream,
+                    &event,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("stored"));
+            assert!(b_dst.bytes().iter().all(|&b| b == 0x5A));
+
+            let mut bad_orig_batch = comp_packets.clone();
+            bad_orig_batch[2].2 ^= 1;
+            let err = bcodec
+                .decode_pages_batch_to_device(
+                    &p_gplan,
+                    &bad_orig_batch,
+                    &comp_dst_spans,
+                    &stream,
+                    &event,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("original"));
             assert!(b_dst.bytes().iter().all(|&b| b == 0x5A));
             drop(bcodec);
         }

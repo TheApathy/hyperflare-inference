@@ -19,7 +19,18 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-pub(super) type SharedGpuCodecs = Arc<Mutex<HashMap<(usize, usize), Arc<Mutex<GpuRankCodec>>>>>;
+type SharedRankMap<T> = Arc<Mutex<HashMap<(usize, usize), Arc<Mutex<T>>>>>;
+
+struct SharedStaging {
+    buf: PinnedHost,
+    alias: u64,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct SharedGpuCodecs {
+    gpu: SharedRankMap<GpuRankCodec>,
+    staging: SharedRankMap<SharedStaging>,
+}
 
 fn cpu_pool() -> flare_selene::Result<&'static rayon::ThreadPool> {
     flare_selene::shared::codec::cpu_pool()
@@ -31,8 +42,8 @@ struct CpuCodec {
     row: Plan,
     gpu_page: GpuPlan,
     gpu_row: GpuPlan,
-    staging: PinnedHost,
-    staging_alias: u64,
+    staging: Arc<Mutex<SharedStaging>>,
+    staging_bytes: usize,
     encode_buf: Vec<u8>,
 }
 
@@ -81,11 +92,42 @@ impl RankCodec {
         )
         .map_err(|e| invalid(e.to_string()))?;
 
-        // Both Cpu and Gpu modes keep one CPU pinned staging buffer so Gpu mode can
-        // transparently decode existing ZKV1 checkpoints and Literal shares.
+        // Share one pinned CPU staging buffer per `(context, rank)` across all host cache tiers
+        // (memory, disk, pool) so GPU mode can decode existing ZKV1 checkpoints and Literal shares
+        // without multiplying pinned host memory by the number of active tiers.
         let bytes = page.original_bytes().max(row.original_bytes());
-        let staging = stream.mapped_host_buffer(bytes)?;
-        let staging_alias = stream.mapped_address(&staging)? as u64;
+        let make_staging = || -> Result<(Arc<Mutex<SharedStaging>>, usize)> {
+            let buf = stream.mapped_host_buffer(bytes)?;
+            let alias = stream.mapped_address(&buf)? as u64;
+            Ok((Arc::new(Mutex::new(SharedStaging { buf, alias })), bytes))
+        };
+        let (staging, staging_bytes) = if let Some(shared) = shared_gpu {
+            let mut map = shared
+                .staging
+                .lock()
+                .expect("shared staging map lock poisoned");
+            if let Some(existing) = map.get(&(context, rank)) {
+                let existing_len = existing
+                    .lock()
+                    .expect("shared staging lock poisoned")
+                    .buf
+                    .bytes()
+                    .len();
+                if existing_len >= bytes {
+                    (existing.clone(), existing_len)
+                } else {
+                    let (created, len) = make_staging()?;
+                    map.insert((context, rank), created.clone());
+                    (created, len)
+                }
+            } else {
+                let (created, len) = make_staging()?;
+                map.insert((context, rank), created.clone());
+                (created, len)
+            }
+        } else {
+            make_staging()?
+        };
         let encode_buf = if geometry.placement == KvCompression::Cpu {
             vec![0; page.max_packet().max(row.max_packet())]
         } else {
@@ -111,7 +153,10 @@ impl RankCodec {
                     )))
                 };
                 let codec = if let Some(shared) = shared_gpu {
-                    let mut map = shared.lock().unwrap();
+                    let mut map = shared
+                        .gpu
+                        .lock()
+                        .expect("shared GPU codec map lock poisoned");
                     if let Some(existing) = map.get(&(context, rank)) {
                         existing.clone()
                     } else {
@@ -122,7 +167,10 @@ impl RankCodec {
                 } else {
                     make_codec()?
                 };
-                let page_batch_cap = codec.lock().unwrap().page_batch_cap();
+                let page_batch_cap = codec
+                    .lock()
+                    .expect("GPU codec lock poisoned")
+                    .page_batch_cap();
                 Some(GpuCodec {
                     codec,
                     page_batch_cap,
@@ -142,7 +190,7 @@ impl RankCodec {
                 gpu_page,
                 gpu_row,
                 staging,
-                staging_alias,
+                staging_bytes,
                 encode_buf,
             },
             gpu,
@@ -354,78 +402,88 @@ impl RankCodec {
                 // Batch multiple pages into the existing pinned staging buffer (sized for
                 // max(page, row)): one D2H burst + one sync, then parallel Rayon encode.
                 let page_bytes = self.cpu.page.original_bytes();
-                let batch_cap = (self.cpu.staging.bytes().len() / page_bytes.max(1)).max(1);
+                let batch_cap = (self.cpu.staging_bytes / page_bytes.max(1)).max(1);
                 let mut page_offset = 0usize;
                 for chunk in job.pages.chunks(batch_cap) {
                     let mut batch_spans = Vec::with_capacity(chunk.len());
                     for (slot_idx, (page, _)) in chunk.iter().enumerate() {
                         let spans = device_spans(geometry, layout, false, u64::from(page.0))?;
-                        let slot_start = slot_idx * page_bytes;
-                        zero_span_gaps(
-                            &mut self.cpu.staging.bytes_mut()[slot_start..slot_start + page_bytes],
-                            &spans,
-                        );
-                        batch_spans.push((slot_start, spans));
+                        batch_spans.push((slot_idx * page_bytes, spans));
                     }
-                    copy_spans_batch(
-                        stream,
-                        event,
-                        Direction::Out,
-                        &batch_spans,
-                        self.cpu.staging_alias,
-                    )?;
-                    let start = Instant::now();
-                    let staging = self.cpu.staging.bytes();
-                    let page_plan = &self.cpu.page;
-                    let profile = &self.cpu_profile;
-                    let encoded: Result<Vec<(PackedUnit, Vec<u8>)>> = if chunk.len() == 1 {
-                        let base_unit = PackedUnit {
-                            kind: Kind::Page as i32,
-                            logical_index: first + page_offset as u64,
-                            stored_rank: rank as u32,
-                            ..Default::default()
+                    let encoded: Vec<(PackedUnit, Vec<u8>)> = {
+                        let mut staging_guard = self
+                            .cpu
+                            .staging
+                            .lock()
+                            .expect("shared staging lock poisoned");
+                        for (slot_start, spans) in &batch_spans {
+                            zero_span_gaps(
+                                &mut staging_guard.buf.bytes_mut()
+                                    [*slot_start..*slot_start + page_bytes],
+                                spans,
+                            );
+                        }
+                        copy_spans_batch(
+                            stream,
+                            event,
+                            Direction::Out,
+                            &batch_spans,
+                            staging_guard.alias,
+                        )?;
+                        let start = Instant::now();
+                        let staging = staging_guard.buf.bytes();
+                        let page_plan = &self.cpu.page;
+                        let profile = &self.cpu_profile;
+                        let encoded: Result<Vec<(PackedUnit, Vec<u8>)>> = if chunk.len() == 1 {
+                            let base_unit = PackedUnit {
+                                kind: Kind::Page as i32,
+                                logical_index: first + page_offset as u64,
+                                stored_rank: rank as u32,
+                                ..Default::default()
+                            };
+                            let (unit, used) = page_plan
+                                .encode_capture(
+                                    base_unit,
+                                    profile,
+                                    &staging[..page_bytes],
+                                    &mut self.cpu.encode_buf,
+                                    Some(pool),
+                                )
+                                .map_err(decode_error)?;
+                            Ok(vec![(unit, self.cpu.encode_buf[..used].to_vec())])
+                        } else {
+                            let max_pkt = page_plan.max_packet();
+                            pool.install(|| {
+                                (0..chunk.len())
+                                    .into_par_iter()
+                                    .map(|slot_idx| {
+                                        let base_unit = PackedUnit {
+                                            kind: Kind::Page as i32,
+                                            logical_index: first + (page_offset + slot_idx) as u64,
+                                            stored_rank: rank as u32,
+                                            ..Default::default()
+                                        };
+                                        let slot_start = slot_idx * page_bytes;
+                                        let mut out = vec![0u8; max_pkt];
+                                        let (unit, used) = page_plan
+                                            .encode_capture(
+                                                base_unit,
+                                                profile,
+                                                &staging[slot_start..slot_start + page_bytes],
+                                                &mut out,
+                                                None,
+                                            )
+                                            .map_err(decode_error)?;
+                                        out.truncate(used);
+                                        Ok((unit, out))
+                                    })
+                                    .collect()
+                            })
                         };
-                        let (unit, used) = page_plan
-                            .encode_capture(
-                                base_unit,
-                                profile,
-                                &staging[..page_bytes],
-                                &mut self.cpu.encode_buf,
-                                Some(pool),
-                            )
-                            .map_err(decode_error)?;
-                        Ok(vec![(unit, self.cpu.encode_buf[..used].to_vec())])
-                    } else {
-                        let max_pkt = page_plan.max_packet();
-                        pool.install(|| {
-                            (0..chunk.len())
-                                .into_par_iter()
-                                .map(|slot_idx| {
-                                    let base_unit = PackedUnit {
-                                        kind: Kind::Page as i32,
-                                        logical_index: first + (page_offset + slot_idx) as u64,
-                                        stored_rank: rank as u32,
-                                        ..Default::default()
-                                    };
-                                    let slot_start = slot_idx * page_bytes;
-                                    let mut out = vec![0u8; max_pkt];
-                                    let (unit, used) = page_plan
-                                        .encode_capture(
-                                            base_unit,
-                                            profile,
-                                            &staging[slot_start..slot_start + page_bytes],
-                                            &mut out,
-                                            None,
-                                        )
-                                        .map_err(decode_error)?;
-                                    out.truncate(used);
-                                    Ok((unit, out))
-                                })
-                                .collect()
-                        })
+                        let encoded = encoded?;
+                        stats.transform_ns += start.elapsed().as_nanos() as u64;
+                        encoded
                     };
-                    let encoded = encoded?;
-                    stats.transform_ns += start.elapsed().as_nanos() as u64;
                     for (unit, bytes) in encoded {
                         stored += unit.stored_length;
                         capture.push(unit, bytes);
@@ -436,33 +494,36 @@ impl RankCodec {
                 if let Some((slot, _)) = &job.row {
                     let n = self.cpu.row.original_bytes();
                     let spans = device_spans(geometry, layout, true, u64::from(slot.0))?;
-                    zero_span_gaps(&mut self.cpu.staging.bytes_mut()[..n], &spans);
-                    copy_spans_batch(
-                        stream,
-                        event,
-                        Direction::Out,
-                        &[(0, spans)],
-                        self.cpu.staging_alias,
-                    )?;
                     let base_unit = PackedUnit {
                         kind: Kind::Row as i32,
                         logical_index: 0,
                         stored_rank: rank as u32,
                         ..Default::default()
                     };
-                    let start = Instant::now();
-                    let (unit, used) = self
-                        .cpu
-                        .row
-                        .encode_capture(
-                            base_unit,
-                            &self.cpu_profile,
-                            &self.cpu.staging.bytes()[..n],
-                            &mut self.cpu.encode_buf,
-                            Some(pool),
-                        )
-                        .map_err(decode_error)?;
-                    stats.transform_ns += start.elapsed().as_nanos() as u64;
+                    let (unit, used) = {
+                        let mut staging_guard = self
+                            .cpu
+                            .staging
+                            .lock()
+                            .expect("shared staging lock poisoned");
+                        zero_span_gaps(&mut staging_guard.buf.bytes_mut()[..n], &spans);
+                        let alias = staging_guard.alias;
+                        copy_spans_batch(stream, event, Direction::Out, &[(0, spans)], alias)?;
+                        let start = Instant::now();
+                        let res = self
+                            .cpu
+                            .row
+                            .encode_capture(
+                                base_unit,
+                                &self.cpu_profile,
+                                &staging_guard.buf.bytes()[..n],
+                                &mut self.cpu.encode_buf,
+                                Some(pool),
+                            )
+                            .map_err(decode_error)?;
+                        stats.transform_ns += start.elapsed().as_nanos() as u64;
+                        res
+                    };
                     stored += unit.stored_length;
                     capture.push(unit, self.cpu.encode_buf[..used].to_vec());
                     transferred += n as u64;
@@ -513,7 +574,13 @@ impl RankCodec {
     ) -> Result<()> {
         let pool = cpu_pool()?;
         let page_bytes = self.cpu.page.original_bytes();
-        let staging_slice = &mut self.cpu.staging.bytes_mut()[..items.len() * page_bytes];
+        let mut staging_guard = self
+            .cpu
+            .staging
+            .lock()
+            .expect("shared staging lock poisoned");
+        let alias = staging_guard.alias;
+        let staging_slice = &mut staging_guard.buf.bytes_mut()[..items.len() * page_bytes];
         let page_plan = &self.cpu.page;
         let gpu_page_plan = &self.cpu.gpu_page;
         let start = Instant::now();
@@ -539,13 +606,7 @@ impl RankCodec {
             })?;
         }
         stats.transform_ns += start.elapsed().as_nanos() as u64;
-        copy_spans_batch(
-            stream,
-            event,
-            Direction::In,
-            batch_spans,
-            self.cpu.staging_alias,
-        )
+        copy_spans_batch(stream, event, Direction::In, batch_spans, alias)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -565,7 +626,7 @@ impl RankCodec {
         let mut transferred = 0u64;
         let mut stored = 0u64;
         let page_bytes = self.cpu.page.original_bytes();
-        let batch_cap = (self.cpu.staging.bytes().len() / page_bytes.max(1)).max(1);
+        let batch_cap = (self.cpu.staging_bytes / page_bytes.max(1)).max(1);
         let all_pages_cpu_path = job.pages.len() > 1
             && job.pages.iter().enumerate().all(|(i, _)| {
                 let idx = first + i as u64;
@@ -747,20 +808,20 @@ impl RankCodec {
                 } else {
                     &self.cpu.gpu_page
                 };
-                let raw = &mut self.cpu.staging.bytes_mut()[..n];
                 let pool = (route != DecodeRoute::Literal).then(cpu_pool).transpose()?;
+                let mut staging_guard = self
+                    .cpu
+                    .staging
+                    .lock()
+                    .expect("shared staging lock poisoned");
+                let alias = staging_guard.alias;
+                let raw = &mut staging_guard.buf.bytes_mut()[..n];
                 let start = Instant::now();
                 decode_unit_cpu(u, route, &chunks, raw, cpu_plan, gpu_plan, pool)?;
                 if route != DecodeRoute::Literal {
                     stats.transform_ns += start.elapsed().as_nanos() as u64;
                 }
-                copy_spans_batch(
-                    stream,
-                    event,
-                    Direction::In,
-                    &[(0, spans)],
-                    self.cpu.staging_alias,
-                )?;
+                copy_spans_batch(stream, event, Direction::In, &[(0, spans)], alias)?;
             }
             transferred += n as u64;
         }
@@ -1428,5 +1489,113 @@ mod tests {
 
         cpu_xfer.close().unwrap();
         gpu_xfer.close().unwrap();
+    }
+
+    #[test]
+    #[ignore = "exercises per-rank pinned staging deduplication across tiers on a GPU"]
+    fn rank_codecs_sharing_copiers_deduplicate_pinned_staging_per_context_and_rank() {
+        let driver = Driver::load().unwrap();
+        let mut ctx = std::ptr::null_mut();
+        unsafe {
+            driver.check("cuInit", (driver.init)(0)).unwrap();
+            driver
+                .check(
+                    "cuDevicePrimaryCtxRetain",
+                    (driver.primary_ctx_retain)(&mut ctx, 0),
+                )
+                .unwrap();
+        }
+        struct PrimaryCtx<'a>(&'a Driver);
+        impl Drop for PrimaryCtx<'_> {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = (self.0.primary_ctx_release)(0);
+                }
+            }
+        }
+        let _guard = PrimaryCtx(&driver);
+        let context = ctx as usize;
+        let stream = Stream::open_lowest_priority(context, 0).unwrap();
+        let event = stream.blocking_event().unwrap();
+        let (page_bytes, row_bytes) = (4096usize, 65536usize);
+        let geometry = CacheGeometry {
+            placement: KvCompression::Cpu,
+            codec_fields: vec![
+                CodecField {
+                    buffer: "kv".into(),
+                    offset: 0,
+                    length: page_bytes as u64,
+                    encoding: 2,
+                },
+                CodecField {
+                    buffer: "state".into(),
+                    offset: 0,
+                    length: row_bytes as u64,
+                    encoding: 1,
+                },
+            ],
+            snapshot_pages: Vec::new(),
+            page_tokens: 64,
+            page_capacity: 2,
+            row_capacity: 2,
+            planes: vec![Plane {
+                name: "kv".into(),
+                address: 0x1000,
+                unit_bytes: page_bytes as u64,
+            }],
+            row: Plane {
+                name: "state".into(),
+                address: 0x20000,
+                unit_bytes: row_bytes as u64,
+            },
+        };
+        let shared = SharedGpuCodecs::default();
+        let memory_tier = RankCodec::new(
+            0,
+            context,
+            &stream,
+            &event,
+            &geometry,
+            Default::default(),
+            None,
+            Some(&shared),
+        )
+        .unwrap();
+        let disk_tier = RankCodec::new(
+            0,
+            context,
+            &stream,
+            &event,
+            &geometry,
+            Default::default(),
+            None,
+            Some(&shared),
+        )
+        .unwrap();
+        let pool_tier = RankCodec::new(
+            0,
+            context,
+            &stream,
+            &event,
+            &geometry,
+            Default::default(),
+            None,
+            Some(&shared),
+        )
+        .unwrap();
+        let other_rank = RankCodec::new(
+            1,
+            context,
+            &stream,
+            &event,
+            &geometry,
+            Default::default(),
+            None,
+            Some(&shared),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&memory_tier.cpu.staging, &disk_tier.cpu.staging));
+        assert!(Arc::ptr_eq(&memory_tier.cpu.staging, &pool_tier.cpu.staging));
+        assert!(!Arc::ptr_eq(&memory_tier.cpu.staging, &other_rank.cpu.staging));
     }
 }

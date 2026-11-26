@@ -647,6 +647,7 @@ pub(crate) fn publish_payload(
         let assembly = progress.phase("Assemble core payloads", Some(ranks.len() as u64));
         validate_ranks(ranks, cluster.as_ref())?;
         let root_rank = &ranks[0].index;
+        preflight_export_fds(ranks, root_rank.assets.len())?;
         let root_payload = &ranks[0].payload;
         let rank_count = u32::try_from(ranks.len()).map_err(|_| invalid("too many ranks"))?;
         let architecture = root_rank.ranks[0].architecture.clone();
@@ -743,7 +744,6 @@ pub(crate) fn publish_payload(
             Some(path) => Some(helios_core::core::cache::Root::open(path)?),
             None => None,
         };
-        preflight_export_fds(ranks, core_payloads.len())?;
         let mut leases: BTreeMap<
             helios_core::core::PayloadId,
             helios_core::core::cache::PayloadObject,
@@ -1213,51 +1213,91 @@ fn safe_group(name: &str) -> Result<String> {
     }
 }
 
-fn preflight_export_fds(ranks: &[RankOutput], core_payloads: usize) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut distinct_cached = BTreeSet::new();
-        let mut uncached_groups = 0usize;
-        for rank in ranks {
-            if let Some(sources) = &rank.weight_payload {
-                for group in sources
-                    .groups
-                    .iter()
-                    .chain(std::iter::once(&sources.initial_state))
-                {
-                    if !group.payload_id.is_empty() {
-                        distinct_cached.insert(group.payload_id.as_slice());
-                    } else if !group.spans.is_empty() {
-                        uncached_groups += 1;
-                    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExportFdBudget {
+    cached_leases: usize,
+    uncached_payloads: usize,
+    required: usize,
+}
+
+fn estimate_export_fds(ranks: &[RankOutput], core_payloads: usize) -> ExportFdBudget {
+    let mut distinct_cached = BTreeSet::new();
+    let mut uncached_payloads = 0usize;
+    for rank in ranks {
+        if let Some(sources) = &rank.weight_payload {
+            for group in sources
+                .groups
+                .iter()
+                .chain(std::iter::once(&sources.initial_state))
+            {
+                if !group.payload_id.is_empty() {
+                    distinct_cached.insert(group.payload_id.as_slice());
+                } else if !group.spans.is_empty() {
+                    uncached_payloads += 1;
                 }
-                if let Some(engram) = &sources.engram {
-                    for source in super::weight_reuse::engram_uses(engram) {
-                        if let Some(slice) = source.slice.as_ref() {
-                            distinct_cached.insert(slice.payload_id.as_slice());
-                        }
+            }
+            if let Some(engram) = &sources.engram {
+                for source in super::weight_reuse::engram_uses(engram) {
+                    if let Some(slice) = source.slice.as_ref() {
+                        distinct_cached.insert(slice.payload_id.as_slice());
                     }
                 }
             }
         }
-        // Each deduplicated cache lease holds 2 FDs (data + flock); each uncached payload and
-        // rank staging file holds 1 FD, plus headroom for standard/runtime FDs and worker I/O.
-        let required = distinct_cached.len() * 2 + uncached_groups + core_payloads + ranks.len() * 4 + 64;
+    }
+    // Uncached Engram tables on rank 0 materialize two payload files per shared table or shard.
+    let reused_engram = ranks
+        .first()
+        .and_then(|rank| rank.weight_payload.as_ref())
+        .and_then(|sources| sources.engram.as_ref())
+        .is_some();
+    if !reused_engram
+        && let Some(engram) = ranks.first().and_then(|rank| rank.index.engram.as_ref())
+    {
+        for table in &engram.tables {
+            if table.shards.is_empty() {
+                uncached_payloads += 2;
+            } else {
+                uncached_payloads += table.shards.len() * 2;
+            }
+        }
+    }
+    // Each deduplicated cache lease holds 2 FDs (data + flock); each uncached payload and
+    // rank staging file holds 1 FD, plus headroom for standard/runtime FDs and worker I/O.
+    let cached_leases = distinct_cached.len();
+    let required = cached_leases * 2 + uncached_payloads + core_payloads + ranks.len() * 4 + 64;
+    ExportFdBudget {
+        cached_leases,
+        uncached_payloads,
+        required,
+    }
+}
+
+fn check_export_fd_limit(budget: ExportFdBudget, soft_limit: u64) -> Result<()> {
+    if (budget.required as u64) > soft_limit {
+        return Err(invalid(format!(
+            "TP core export needs approximately {} open file descriptors ({} cached leases, \
+             {} uncached weight payloads), exceeding the current soft limit of {soft_limit}; \
+             raise it with `ulimit -Sn {}` before exporting",
+            budget.required, budget.cached_leases, budget.uncached_payloads, budget.required
+        )));
+    }
+    Ok(())
+}
+
+fn preflight_export_fds(ranks: &[RankOutput], core_payloads: usize) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let budget = estimate_export_fds(ranks, core_payloads);
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
         };
+        // SAFETY: `limit` is a valid mutable `libc::rlimit` passed to `getrlimit(RLIMIT_NOFILE)`.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0
             && limit.rlim_cur != libc::RLIM_INFINITY
-            && (required as u64) > limit.rlim_cur
         {
-            return Err(invalid(format!(
-                "TP core export needs approximately {required} open file descriptors ({} cached leases, \
-                 {uncached_groups} uncached weight payloads), exceeding the current soft limit of {}; \
-                 raise it with `ulimit -n {required}` before exporting",
-                distinct_cached.len(),
-                limit.rlim_cur
-            )));
+            check_export_fd_limit(budget, limit.rlim_cur)?;
         }
     }
     #[cfg(not(unix))]
@@ -4888,5 +4928,91 @@ mod packing_metadata_tests {
         };
         let (_, packing, _) = super::prepared_provenance(&absent);
         assert!(packing.is_none());
+    }
+
+    #[test]
+    fn preflight_export_fds_counts_deduplicated_leases_uncached_payloads_and_rejects_low_limit() {
+        use super::{RankOutput, wire};
+        use crate::export::{WeightPayloadGroup, WeightPayloadSourceSpan, WeightPayloadSources};
+        let shared_id = vec![0x11u8; 32];
+        let rank0_id = vec![0x22u8; 32];
+        let rank1_id = vec![0x33u8; 32];
+        let make_group = |name: &str, payload_id: Vec<u8>, with_span: bool| WeightPayloadGroup {
+            name: name.into(),
+            storage: "stable".into(),
+            spans: if with_span {
+                vec![WeightPayloadSourceSpan {
+                    allocation: "weights".into(),
+                    destination_offset: 0,
+                    source_offset: 0,
+                    nbytes: 64,
+                }]
+            } else {
+                vec![]
+            },
+            payload_id,
+            nbytes: if with_span { 64 } else { 0 },
+        };
+        let make_rank = |unique_id: Vec<u8>, engram: Option<wire::Engram>| RankOutput {
+            hardware: None,
+            payload_leases: Default::default(),
+            index: wire::ModelIndex {
+                engram,
+                ..Default::default()
+            },
+            payload: vec![],
+            allocations: vec![],
+            module_globals: vec![],
+            external: vec![],
+            staging: None,
+            weight_payload: Some(WeightPayloadSources {
+                groups: vec![
+                    make_group("shared", shared_id.clone(), true),
+                    make_group("shard", unique_id, true),
+                    make_group("uncached", vec![], true),
+                ],
+                initial_state: make_group("initial_state", vec![], false),
+                views: vec![],
+                cached: vec![],
+                engram: None,
+            }),
+        };
+        let engram = wire::Engram {
+            tables: vec![
+                wire::EngramTable {
+                    shards: vec![],
+                    ..Default::default()
+                },
+                wire::EngramTable {
+                    shards: vec![
+                        wire::EngramTableShard::default(),
+                        wire::EngramTableShard::default(),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let ranks = vec![make_rank(rank0_id, Some(engram)), make_rank(rank1_id, None)];
+        // 3 distinct cached leases (shared_id deduplicated across both ranks + rank0_id + rank1_id)
+        // 2 uncached weight groups (1 per rank) + 6 uncached Engram planes (2 shared + 2*2 sharded)
+        // 2 core frontend payloads + 2 ranks * 4 + 64 headroom = 6 + 8 + 2 + 8 + 64 = 88
+        let budget = super::estimate_export_fds(&ranks, 2);
+        assert_eq!(budget.cached_leases, 3);
+        assert_eq!(budget.uncached_payloads, 8);
+        assert_eq!(budget.required, 88);
+
+        super::check_export_fd_limit(budget, budget.required as u64).unwrap();
+        let err = super::check_export_fd_limit(budget, (budget.required - 1) as u64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("88 open file descriptors"), "{err}");
+        assert!(err.contains("3 cached leases"), "{err}");
+        assert!(err.contains("8 uncached weight payloads"), "{err}");
+        assert!(err.contains("soft limit of 87"), "{err}");
+        assert!(err.contains("ulimit -Sn 88"), "{err}");
+
+        // Small export passes against the live process RLIMIT_NOFILE.
+        super::preflight_export_fds(&ranks, 2).unwrap();
     }
 }
