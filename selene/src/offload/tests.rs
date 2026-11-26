@@ -701,3 +701,19 @@ fn intake_shrinks_to_two_full_windows_without_refusing() {
         intake_slots(&layout, 1) as u64 * layout.page_record_bytes
     );
 }
+
+#[test]
+fn host_os_reserve_and_budget_from_preserve_safety_floor() {
+    let gib = 1u64 << 30;
+    let total_128 = 128 * gib;
+    let reserve_128 = host_os_reserve_bytes(total_128);
+    assert_eq!(reserve_128, HOST_SERVICE_HEADROOM_BYTES + total_128 / HOST_SYSTEM_SHARE);
+    // 2 GiB + 6.4 GiB = 8.4 GiB exact.
+    assert_eq!(reserve_128, 2 * gib + (128 * gib) / 20);
+    assert_eq!(
+        host_budget_from(100 * gib, total_128, 10 * gib),
+        100 * gib - 10 * gib - reserve_128
+    );
+    assert_eq!(host_budget_from(reserve_128, total_128, 0), 0);
+    assert_eq!(host_budget_from(reserve_128 - 1, total_128, 0), 0);
+}

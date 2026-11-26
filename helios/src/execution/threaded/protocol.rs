@@ -30,7 +30,7 @@ pub(crate) fn can_submit_pending<P: PendingFrame>(
             frame.grammar()
                 || !matches!(
                     manifest.graphs[frame.graph()].kind,
-                    GraphKind::Decode | GraphKind::Speculative
+                    GraphKind::Decode | GraphKind::Speculative | GraphKind::Prefill
                 )
         })
 }

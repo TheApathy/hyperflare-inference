@@ -348,6 +348,9 @@ impl LiveRequest {
     pub fn reused_prompt_tokens(&self) -> u64 {
         self.admission_reused_tokens
     }
+    pub(super) fn prefill_cursor(&self) -> u64 {
+        self.consumed_tokens.max(self.scheduled_consumed)
+    }
     pub fn snapshot_destination(&self) -> SnapshotId {
         self.boundary_capture
             .map(|c| c.snapshot)
@@ -549,6 +552,7 @@ impl ScheduledPlan {
 
 struct Submission {
     step: ScheduledStep,
+    delivers_feedback: bool,
     expected_finish_ns: u64,
     estimated_duration_ns: u64,
     participants: [Option<service::ServiceParticipant>; REQUEST_LANES],
@@ -873,6 +877,17 @@ impl RequestScheduler {
         work: usize,
         cut: Option<usize>,
     ) -> GraphKind {
+        self.resolve_prefill_kind_from(request, request.prefill_cursor() as usize, capacity, work, cut)
+    }
+
+    pub(super) fn resolve_prefill_kind_from(
+        &self,
+        request: &LiveRequest,
+        start: usize,
+        capacity: usize,
+        work: usize,
+        cut: Option<usize>,
+    ) -> GraphKind {
         if request.prompt_logprobs {
             return GraphKind::ScoredPrefill;
         }
@@ -883,7 +898,7 @@ impl RequestScheduler {
             .unwrap_or(request.prompt_tokens)
             .min(request.prefill_limit())
             .min(request.prompt_tokens);
-        let end = (request.consumed_tokens as usize).saturating_add(work);
+        let end = start.saturating_add(work);
         let window = self.terminal_prefill_window();
         if end >= next_stop || (window > 0 && next_stop.saturating_sub(end) <= window) {
             GraphKind::TerminalPrefill
@@ -897,6 +912,19 @@ impl RequestScheduler {
         request: &LiveRequest,
         cut: Option<usize>,
     ) -> bool {
+        self.prefill_requires_terminal_completion_from(
+            request,
+            request.prefill_cursor() as usize,
+            cut,
+        )
+    }
+
+    pub(super) fn prefill_requires_terminal_completion_from(
+        &self,
+        request: &LiveRequest,
+        start: usize,
+        cut: Option<usize>,
+    ) -> bool {
         if request.prompt_logprobs || self.terminal_prefill_catalog.is_empty() {
             return false;
         }
@@ -904,14 +932,14 @@ impl RequestScheduler {
             .unwrap_or(request.prompt_tokens)
             .min(request.prefill_limit())
             .min(request.prompt_tokens);
-        let remaining = next_stop.saturating_sub(request.consumed_tokens as usize);
+        let remaining = next_stop.saturating_sub(start);
         if remaining == 0 {
             return false;
         }
         let Some(&max_capacity) = self.prefill_catalog.last() else {
             return false;
         };
-        if self.prefill_work_through(request, max_capacity, cut) < remaining {
+        if self.prefill_work_from(request, start, max_capacity, cut) < remaining {
             return false;
         }
         let Some(&smallest_fit) = self.prefill_catalog.iter().find(|&&cap| cap >= remaining) else {
@@ -1136,7 +1164,8 @@ impl RequestScheduler {
         step: &ScheduledStep,
         timing: crate::execution::ExecutionTiming,
     ) {
-        self.costs.observe(step, timing);
+        self.costs
+            .observe(step, timing, Some(self.step_delivers_feedback(step)));
     }
 
     pub fn submitted_timing(&self, fence: Fence) -> Result<SubmittedTiming> {
@@ -1161,16 +1190,79 @@ impl RequestScheduler {
     }
 
     pub fn plan_requires_feedback(&self, plan: &ScheduledPlan) -> bool {
-        let geometry = (plan.kind, plan.batch_capacity, plan.draft_tokens, plan.token_capacity,
-            plan.packed_token_capacity, plan.prefill_capacity());
-        plan.requires_feedback || !matches!(plan.kind, GraphKind::Decode | GraphKind::Speculative)
-            || self.capabilities.completion_inputs.iter().any(|(key, inputs)| *key == geometry && !inputs.is_empty())
-            || plan.lanes.iter().any(|lane| self.request(lane.request).is_ok_and(|request|
-                request.grammar_constrained || request.host_stops
-                    || self.proposal_source == speculation::ProposalSource::Copy
-                    || self.decoded_history.is_some()))
+        plan.requires_feedback
+            || self.plan_delivers_feedback(plan)
             || !self.costs.is_fresh(cost::Key::from_step(plan))
             || plan.origin.is_probe()
+    }
+
+    /// Whether the host must consume this plan's completion before another submission
+    /// for reasons other than measuring its cost.
+    fn plan_delivers_feedback(&self, plan: &ScheduledPlan) -> bool {
+        plan.checkpoint_plans.iter().any(checkpoints::CapturePlan::has_cut)
+            || self.step_delivers_feedback_without_cuts(&plan.step)
+    }
+
+    /// Whether the host must consume this step's completion before another submission
+    /// for reasons other than measuring its cost.
+    fn step_delivers_feedback(&self, step: &ScheduledStep) -> bool {
+        if self.step_delivers_feedback_without_cuts(step) {
+            return true;
+        }
+        step.kind == GraphKind::Prefill
+            && step.lanes.iter().any(|lane| {
+                let end = lane.start_position.saturating_add(lane.tokens as u64);
+                self.request(lane.request).is_ok_and(|request| {
+                    request.checkpoints.has_cut_at(end)
+                        || request
+                            .message_boundaries
+                            .binary_search(&(end as usize))
+                            .is_ok()
+                })
+            })
+    }
+
+    fn step_delivers_feedback_without_cuts(&self, step: &ScheduledStep) -> bool {
+        let geometry = (
+            step.kind,
+            step.batch_capacity,
+            step.draft_tokens,
+            step.token_capacity,
+            step.packed_token_capacity,
+            step.prefill_capacity(),
+        );
+        if self
+            .capabilities
+            .completion_inputs
+            .iter()
+            .any(|(key, inputs)| *key == geometry && !inputs.is_empty())
+        {
+            return true;
+        }
+        match step.kind {
+            GraphKind::Decode | GraphKind::Speculative => step.lanes.iter().any(|lane| {
+                self.request(lane.request).is_ok_and(|request| {
+                    request.grammar_constrained
+                        || request.host_stops
+                        || self.proposal_source == speculation::ProposalSource::Copy
+                        || self.decoded_history.is_some()
+                })
+            }),
+            GraphKind::Prefill => {
+                step.lanes.is_empty()
+                    || step.lanes.iter().any(|lane| {
+                        self.request(lane.request).map_or(true, |request| {
+                            let end = lane.start_position.saturating_add(lane.tokens as u64);
+                            lane.tokens == 0
+                                || request.prompt_logprobs
+                                || end >= request.prompt_tokens as u64
+                                || end >= request.prefill_limit() as u64
+                                || request.checkpoint_capture.is_some()
+                        })
+                    })
+            }
+            _ => true,
+        }
     }
 
     fn selected_cost(&self, key: cost::Key) -> SelectedCost {
@@ -2334,6 +2426,7 @@ impl RequestScheduler {
             }
         }
         let feedback = self.plan_requires_feedback(plan);
+        let delivers_feedback = self.plan_delivers_feedback(plan);
         if self.submissions.len() >= 2
             || (feedback && !self.submissions.is_empty())
             || self.submissions.values().any(|step| step.requires_feedback)
@@ -2431,6 +2524,7 @@ impl RequestScheduler {
             fence,
             Submission {
                 step: ScheduledStep { requires_feedback: feedback, ..step.clone() },
+                delivers_feedback,
                 expected_finish_ns,
                 estimated_duration_ns: plan.estimated_duration_ns,
                 participants,
@@ -2648,7 +2742,11 @@ impl RequestScheduler {
         self.refresh.validate_completion(step.origin, timing)?;
         let submission = self.submissions.remove(&fence).unwrap();
         self.refresh.complete(submission.origin, timing);
-        self.observe_execution(&submission.step, timing);
+        self.costs.observe(
+            &submission.step,
+            timing,
+            (!submission.origin.is_probe()).then_some(submission.delivers_feedback),
+        );
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
@@ -2705,8 +2803,10 @@ impl RequestScheduler {
                 continue;
             }
             let record = &records[lane.request.slot as usize];
-            let finished =
-                record.status == 3 || ((record.status >= 2 || record.generated_tokens == request.max_new_tokens as i64)
+            let finished = record.status == 3
+                || request.error_code.is_some()
+                || ((record.status >= 2
+                    || record.generated_tokens == request.max_new_tokens as i64)
                     && record.consumed_tokens >= request.prompt_tokens as i64);
             if matches!(kind, GraphKind::Speculative)
                 && record.status != 3
@@ -2749,7 +2849,7 @@ impl RequestScheduler {
                 0
             };
             let output = (record.generated_tokens - request.generated_tokens as i64) as u32;
-            if record.status != 3 {
+            if record.status != 3 && request.error_code.is_none() {
                 request.accounting.credit(prefill, output, now_ns);
                 useful_tokens[lane.request.slot as usize] = prefill + u64::from(output);
             }

@@ -351,7 +351,7 @@ pub fn scheduler_capabilities_with_manifest(
         let semantics = config.contract.graph(&graph.name)?;
         let inputs: Vec<_> = semantics.inputs.iter().filter(|binding|
             matches!(binding.source, ValueSource::PendingToken | ValueSource::PromptAndPendingToken)
-                || matches!(graph.kind, GraphKind::Decode | GraphKind::Speculative | GraphKind::Mixed)
+                || matches!(graph.kind, GraphKind::Prefill | GraphKind::Decode | GraphKind::Speculative | GraphKind::Mixed)
                     && matches!(binding.source, ValueSource::ConsumedTokens | ValueSource::SnapshotConsumedTokens))
             .map(|binding| binding.buffer.clone()).collect();
         if !inputs.is_empty() {

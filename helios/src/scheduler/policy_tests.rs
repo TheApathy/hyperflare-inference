@@ -55,7 +55,7 @@ fn equal_counts_from_different_cohorts_and_different_logical_prefixes_are_not_pr
     ready(&mut s, &handles);
     let candidate = Candidate { host_lengths: None, draft_tokens: 0, kind: GraphKind::Speculative, mask: 1 << handles[0].slot,
         batch: 1, capacity: 1, packed_token_capacity: 1, prefill_capacity: 0, prefill_slot: None,
-        work: 0, duration_ns: MS, rate: ValueRate::new(MS, 1.0, 0.0), feedback: true,
+        work: 0, duration_ns: MS, rate: ValueRate::new(MS, 1.0, 0.0),
         };
     assert!(!s.dominates_padding(candidate, Candidate { batch: 4, capacity: 4, draft_tokens: 3, packed_token_capacity: 16, ..candidate }));
     assert!(!s.dominates_padding(candidate, Candidate { batch: 4, packed_token_capacity: 4, mask: 1 << handles[1].slot, ..candidate }));
@@ -1419,22 +1419,37 @@ fn long_prefill_and_low_acceptance_decode_both_make_progress() {
 }
 
 #[test]
-fn prefill_frames_drain_even_when_the_next_request_is_independent() {
+fn non_terminal_prefill_pipelines_two_frames_while_terminal_prefill_drains() {
     let mut s = interactive_engine(2, false);
     add(&mut s, 1, 32768, 128);
     add(&mut s, 2, 32768, 128);
     step(&mut s, 0);
     let first = s.plan().unwrap();
     assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 4096));
+    assert!(!first.requires_feedback);
     let fence = Fence(s.submitted.0 + 1);
     s.commit(&first, fence).unwrap();
-    assert!(s.plan().is_none());
     assert!(first.estimated_duration_ns() > 10 * MS);
-    complete(&mut s, &first, fence, 0, false);
     let second = s.plan().unwrap();
     assert_eq!((second.kind, second.token_capacity), (GraphKind::Prefill, 4096));
+    assert!(!second.requires_feedback);
     s.commit(&second, Fence(fence.0 + 1)).unwrap();
+    // Window is full at two queued prefill frames.
     assert!(s.plan().is_none());
+    complete(&mut s, &first, fence, 0, false);
+    complete(&mut s, &second, Fence(fence.0 + 1), 0, false);
+
+    // Terminal prefill still drains even when another request is independent.
+    let mut terminal = interactive_engine(2, false);
+    add(&mut terminal, 1, 4096, 128);
+    add(&mut terminal, 2, 4096, 128);
+    step(&mut terminal, 0);
+    let term = terminal.plan().unwrap();
+    assert_eq!((term.kind, term.token_capacity), (GraphKind::Prefill, 4096));
+    assert!(term.requires_feedback);
+    let f = Fence(terminal.submitted.0 + 1);
+    terminal.commit(&term, f).unwrap();
+    assert!(terminal.plan().is_none());
 }
 
 #[test]

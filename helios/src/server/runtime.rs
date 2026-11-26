@@ -474,6 +474,19 @@ impl Active<'_> {
     }
 }
 
+pub(crate) fn validate_multi_host_offload(
+    separate_rank_processes: bool,
+    offload: Option<&crate::offload::Binding>,
+) -> Result<()> {
+    if separate_rank_processes && offload.is_some_and(|binding| !binding.multi_host_ready()) {
+        return Err(Error::execution(
+            ExecutionError::Manifest,
+            "the host prefix store requires every rank in one process",
+        ));
+    }
+    Ok(())
+}
+
 pub struct ModelRuntime {
     sender: mpsc::SyncSender<Vec<Incoming>>,
     stop: Arc<AtomicBool>,
@@ -565,13 +578,10 @@ impl ModelRuntime {
         let thread = thread::Builder::new()
             .name("flare-model".into())
             .spawn(move || {
-                if matches!(peers, Some(crate::execution::RankPeers::Processes(_)))
-                    && manifest.offload.as_ref().is_some_and(|binding| !binding.sharded())
-                {
-                    let error = Error::execution(
-                        ExecutionError::Manifest,
-                        "the host prefix store requires every rank in one process",
-                    );
+                if let Err(error) = validate_multi_host_offload(
+                    matches!(peers, Some(crate::execution::RankPeers::Processes(_))),
+                    manifest.offload.as_ref(),
+                ) {
                     let _ = ready_tx.send(Err(error.clone()));
                     return Shutdown {
                         drained: true,
@@ -4234,6 +4244,52 @@ mod tests {
         now_ns += 500_000;
         assert!(worker.plan_at(1, now_ns).unwrap().0.is_none());
         assert_eq!(worker.plan_evaluations, evals_before + 2);
+    }
+
+    #[test]
+    fn multi_host_offload_gate_accepts_pool_only_and_rejects_unsharded_local_tiers() {
+        // Without an offload binding or without separate rank processes, startup passes.
+        assert!(validate_multi_host_offload(false, None).is_ok());
+        assert!(validate_multi_host_offload(true, None).is_ok());
+
+        // Single-process warm-memory and unjoined local-disk stores are accepted for
+        // single-process serving and rejected for separate rank processes (`RankPeers::Processes`).
+        let dir = std::env::temp_dir().join(format!(
+            "flare-multi-host-gate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (memory_bytes, shard) in [(Some(8 << 20), None), (Some(0), Some((0, 2)))] {
+            let sub = dir.join(if shard.is_some() { "disk-unjoined" } else { "warm-disk" });
+            let options = crate::offload::PrefixCacheOffload {
+                memory_bytes,
+                disk: Some(sub),
+                disk_limit: Some(16 << 20),
+                ..Default::default()
+            };
+            let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
+            let prep = flare_selene::offload::prepare_with_inputs(
+                &options,
+                std::path::Path::new("model.safetensors"),
+                [9; 32],
+                geometry,
+                vec![(0, 0)],
+                1,
+                0,
+                shard,
+                &flare_selene::testing::IdentityRegistrar,
+            )
+            .unwrap();
+            let shared = prep.into_shared().unwrap();
+            let binding = crate::offload::Binding::new(
+                flare_selene::offload::Binding::new(shared, 0),
+                Vec::new(),
+            );
+            assert!(!binding.multi_host_ready());
+            assert!(validate_multi_host_offload(false, Some(&binding)).is_ok());
+            assert!(validate_multi_host_offload(true, Some(&binding)).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

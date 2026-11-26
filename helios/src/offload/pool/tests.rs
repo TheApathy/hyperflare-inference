@@ -160,6 +160,158 @@ fn peer_registration_budget_fails_startup() {
     }
 }
 
+#[test]
+fn multi_host_pool_only_rank_zero_and_peer_join_and_are_ready() {
+    use super::super::shard::{PoolOffer, pool_peer, pool_rank_zero};
+    use crate::execution::RankStream;
+    use std::net::{TcpListener, TcpStream};
+
+    let pair = || {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let server = listener.accept().unwrap().0;
+        (server, client)
+    };
+
+    let mut manager = Manager::new();
+    manager.run();
+    let (a, b) = pair();
+    let mut streams = [RankStream::Tcp(a)];
+    let mut peer_stream = RankStream::Tcp(b);
+    let identity = [11; 32];
+    let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
+    let layout = flare_selene::geometry::fingerprint(&geometry);
+    let peer_offer = PoolOffer {
+        enabled: true,
+        identity,
+        layout,
+        codec_profile: None,
+        rank: 1,
+        world: 2,
+        gpu_uuid: [2; 16],
+    };
+    let zero_offer = PoolOffer {
+        rank: 0,
+        gpu_uuid: [1; 16],
+        ..peer_offer.clone()
+    };
+    let peer_thread = thread::spawn(move || {
+        pool_peer(peer_offer, &mut peer_stream).unwrap()
+    });
+    let zero_peers = pool_rank_zero(zero_offer, &mut streams).unwrap();
+    let peer_peers = peer_thread.join().unwrap();
+    let options = PoolOptions {
+        address: manager.address(),
+        ca: None,
+    };
+    let peer_options = options.clone();
+    let peer_geometry = geometry.clone();
+    let peer_start = thread::spawn(move || {
+        start_with_registrar(
+            &peer_options,
+            identity,
+            &peer_geometry,
+            vec![[2; 16]],
+            0,
+            unlimited(),
+            &StartupProgress::silent(),
+            Arc::new(Registrar::default()),
+            peer_peers,
+            false,
+        )
+    });
+    let (zero_pool, _) = start_with_registrar(
+        &options,
+        identity,
+        &geometry,
+        vec![[1; 16]],
+        0,
+        unlimited(),
+        &StartupProgress::silent(),
+        Arc::new(Registrar::default()),
+        zero_peers,
+        false,
+    )
+    .unwrap();
+    let (peer_pool, _) = peer_start.join().unwrap().unwrap();
+    wait("startup", || zero_pool.client.as_ref().unwrap().status() == PoolStatus::Ready);
+    wait("startup", || peer_pool.agent.as_ref().unwrap().status() == PoolStatus::Ready);
+
+    let offload_options = super::super::PrefixCacheOffload {
+        pool: Some(options),
+        ..Default::default()
+    };
+    let mut zero_prep = super::super::prepare_with_inputs(
+        &offload_options,
+        std::path::Path::new("model.safetensors"),
+        identity,
+        geometry.clone(),
+        vec![(0, 0)],
+        1,
+        0,
+        Some((0, 2)),
+    )
+    .unwrap();
+    let super::super::Preparation::Store(zero_res) = &mut zero_prep else {
+        panic!("expected pool-only rank-0 resources");
+    };
+    zero_res.pool = Some(zero_pool);
+    let zero_shared = zero_prep.into_shared().unwrap();
+
+    let mut peer_prep = super::super::prepare_with_inputs(
+        &offload_options,
+        std::path::Path::new("model.safetensors"),
+        identity,
+        geometry,
+        vec![(0, 0)],
+        1,
+        0,
+        Some((1, 2)),
+    )
+    .unwrap();
+    let super::super::Preparation::Store(peer_res) = &mut peer_prep else {
+        panic!("expected pool-only peer resources");
+    };
+    peer_res.pool = Some(peer_pool);
+    let peer_shared = peer_prep.into_shared().unwrap();
+
+    let (join_zero, join_peer) = pair();
+    let peer_join = thread::spawn(move || {
+        super::super::shard::join_peer(
+            Some(&peer_shared),
+            Vec::new(),
+            &mut RankStream::Tcp(join_peer),
+            1,
+            2,
+        )
+        .unwrap()
+        .unwrap()
+    });
+    let summary = super::super::shard::join_rank_zero(
+        Some(&zero_shared),
+        &mut [RankStream::Tcp(join_zero)],
+    )
+    .unwrap();
+    assert_eq!(
+        summary.as_deref(),
+        Some("pool only across rank processes: restores only")
+    );
+    let binding = super::super::Binding::new(
+        flare_selene::offload::Binding::new(zero_shared, 0),
+        Vec::new(),
+    );
+    assert!(!binding.sharded(), "pool-only mode has no disk shards");
+    assert!(
+        binding.multi_host_ready(),
+        "multi-host pool-only rank-0 store must be accepted for separate rank processes"
+    );
+    #[cfg(feature = "server")]
+    crate::server::runtime::validate_multi_host_offload(true, Some(&binding)).unwrap();
+    let (mut prepared, _) = binding.take().unwrap();
+    prepared.pool.take().unwrap().close().unwrap();
+    peer_join.join().unwrap().join().unwrap();
+}
+
 fn start_with_registrar(
     options: &PoolOptions,
     identity: [u8; 32],

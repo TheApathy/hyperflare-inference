@@ -732,7 +732,7 @@ impl RequestScheduler {
         Some(Candidate { host_lengths: Some(host_lengths), draft_tokens: shape.drafts, kind: GraphKind::Speculative,
             mask, batch: shape.batch, capacity: shape.width, packed_token_capacity: shape.tokens,
             prefill_capacity: 0, prefill_slot: None, work: 0, duration_ns: shape.nanos,
-            rate: ValueRate::new(shape.nanos, value, age), feedback: false })
+            rate: ValueRate::new(shape.nanos, value, age) })
     }
 
     pub(super) fn packed_round_candidates(&self, output: &mut Vec<Candidate>,
@@ -894,7 +894,7 @@ impl RequestScheduler {
                 output.push(Candidate { host_lengths, draft_tokens: shape.drafts, kind: GraphKind::Speculative,
                     mask, batch: shape.batch, capacity: shape.width, packed_token_capacity: shape.tokens,
                     prefill_capacity: 0, prefill_slot: None, work: 0, duration_ns: nanos,
-                    rate: ValueRate::new(nanos, value, age), feedback: false,
+                    rate: ValueRate::new(nanos, value, age),
                     });
             }
         }

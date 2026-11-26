@@ -316,6 +316,16 @@ impl Prepared {
         })
     }
 
+    /// Whether this prepared store serves multi-host pool-only restores across
+    /// separate rank processes without a local warm memory or disk tier.
+    pub(crate) fn pool_only_multi_host(&self) -> bool {
+        self.rank_process
+            && self.warm_bytes == 0
+            && self.directory_lock.is_none()
+            && self.memory_pool.is_none()
+            && self.pool.as_ref().is_some_and(|pool| pool.client.is_some())
+    }
+
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         if let Some(pool) = &self.memory_pool {
@@ -427,6 +437,15 @@ impl Binding {
             .lock()
             .as_ref()
             .is_some_and(|prepared| !prepared.shards.is_empty())
+    }
+
+    /// Whether the prepared store can serve across separate rank processes:
+    /// either local disk records are mirrored onto peer ranks, or it is a
+    /// pool-only restore store whose pool client coordinates with peer rank agents.
+    pub fn multi_host_ready(&self) -> bool {
+        self.shared.lock().as_ref().is_some_and(|prepared| {
+            !prepared.shards.is_empty() || prepared.pool_only_multi_host()
+        })
     }
 }
 
@@ -719,6 +738,21 @@ mod tests;
 
 pub const HOST_SERVICE_HEADROOM_BYTES: u64 = 2 << 30;
 pub const HOST_SYSTEM_SHARE: u64 = 20;
+
+/// Operating-system and post-sizing host service reserve: `HOST_SERVICE_HEADROOM_BYTES`
+/// plus one twentieth of total system memory (`8.4 GiB` on a `128 GiB` system).
+pub const fn host_os_reserve_bytes(total: u64) -> u64 {
+    HOST_SERVICE_HEADROOM_BYTES.saturating_add(total / HOST_SYSTEM_SHARE)
+}
+
+/// Host memory available for offload allocations from an `(available, total)` memory
+/// snapshot after subtracting `future` bytes and [`host_os_reserve_bytes`].
+pub const fn host_budget_from(available: u64, total: u64, future: u64) -> u64 {
+    available
+        .saturating_sub(future)
+        .saturating_sub(host_os_reserve_bytes(total))
+}
+
 pub fn available_memory(meminfo: &str, total: usize) -> Result<usize> {
     let available = meminfo.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -760,9 +794,7 @@ pub fn host_pool_budget(future: u64) -> Result<u64> {
         }
         (memory.ullAvailPhys, memory.ullTotalPhys)
     };
-    Ok(available
-        .saturating_sub(future)
-        .saturating_sub(HOST_SERVICE_HEADROOM_BYTES + total / HOST_SYSTEM_SHARE))
+    Ok(host_budget_from(available, total, future))
 }
 
 /// Resources retained from pre-sizing registration through the worker's store attachment.

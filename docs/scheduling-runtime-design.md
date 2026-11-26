@@ -170,9 +170,14 @@ never the proposals or allocation of the completed program.
 
 Cost samples use GPU replay intervals for the full graph, including proposal
 work, allocation, verification, commit, and collectives, with the embedding-readiness
-correction described below. Host delays and queue wait do not enter graph estimates.
-A trace attaches physical B/D/W/P, selected cost, observation
-age, selection reason, and exploration credit to each committed plan.
+correction described below. GPU replay and serial host handoff have separate
+estimates; queued completion wall time does not become a drained handoff sample.
+Handoff is charged only where it leaves the GPU idle: the median handoff of a
+graph's drained executions is multiplied by the share of its last 16 ordinary
+executions that had to deliver completion feedback before the next submission.
+Host delays around pipelined executions and probes that drain only to measure do
+not change a graph's cost. A trace attaches physical B/D/W/P, selected cost,
+observation age, selection reason, and exploration credit to each committed plan.
 `flare_speculative_*` counters cover complete speculative programs rather than
 separate producer and target calls.
 
@@ -403,8 +408,11 @@ When the prepared graphs expose frame-owned readiness timestamps, the cost sampl
 subtracts exposed embedding-delivery delay after aggregating the ranks' intervals.
 This covers RAM and disk delivery, including CPU mailbox coordination. Service
 charges and reported throughput use the raw replay and wall durations.
-Graph estimates use these GPU observations for both isolated and queued executions.
-Host dispatch, completion delivery, and polling time do not enter a graph's cost.
+Graph estimates add exposed host handoff—the median drained handoff of
+feedback-gated executions weighted by the fraction of the graph's last 16
+ordinary executions that required completion feedback—to the median GPU replay
+duration. Queued wall time, host delays around pipelined executions, and timing
+or acceptance probes that drain only to measure do not inflate graph estimates.
 Missing or zero device intervals neither change an estimate nor make it fresh.
 
 Pure prefill exploration restricts unmeasured graphs (`PREFILL`,
@@ -539,9 +547,13 @@ resource availability, and feedback dependencies without rerunning selection.
 Cancellation stops further selection immediately; pages and state slots remain
 owned through their last submitted fence.
 
-The transport has two frame slots. Only ordinary decode and complete speculative
-generation may occupy both. Prefill, scored prefill, mixed execution, resume,
-vision, and state operations drain the window. Unknown or stale costs, grammar,
+The transport has two frame slots. Ordinary decode, complete speculative
+generation, and strictly non-terminal `PREFILL` chunks may occupy both. A
+`PREFILL` step may pipeline only when every scheduled lane stops strictly before
+its prompt end, checkpoint cut, and conditioned-window boundary, samples no
+token, uses a fresh measured cost, and binds no completion-fed inputs. Terminal
+`PREFILL`, `TERMINAL_PREFILL`, scored prefill, mixed execution, resume, vision,
+and state operations drain the window. Unknown or stale costs, grammar,
 host stops, host-fed pending tokens or committed cursors, history inputs, and
 phase transitions also require completion feedback. Dependency checks apply to the actual selected
 program. A finishing prefill exposes its decoder and checkpoint operation only

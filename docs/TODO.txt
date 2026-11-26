@@ -110,8 +110,10 @@
     latency measurements; measure GPU replay, queueing, and host planning separately.
     See scheduling-runtime-design.md#funded-timing-refresh.
 
-[ ] Extend the two-frame submission window to nonterminal prefill with
-    device-owned continuation positions and fenced cache reservations.
+[ ] Qualify two-frame non-terminal prefill pipelining on live GPU serving
+    (the scheduler, transport, and rank protocol pipeline strictly non-terminal
+    prefill chunks with fenced page reservations; live GPU replay and TTFT
+    overlap remain to be measured on exported cores).
 
 [ ] Qualify prompt scoring on remaining recipes and cache lifecycles;
     see docs/logprobs-design.md for TP4 costs and numerical limits.
@@ -222,11 +224,10 @@
     `selene/src/pool/records.rs` v4 headers, directories, and packed slicing
     (currently rejected at startup in `selene/src/offload.rs`).
 
-[ ] Resolve pool-only host retention for ranks on separate hosts.
-    prefix-cache-offload.md section 1 allows it, while ModelRuntime::start in
-    helios/src/server/runtime.rs requires shard links that
-    selene/src/offload/sharded.rs creates only with a record directory. Close
-    when a multi-host pool-only launch serves or the documents exclude it.
+[ ] Qualify multi-host pool-only serving (`--rank` + `--prefix-cache-pool`
+    without `--prefix-cache-disk`) on separate hosts (startup and rank join
+    accept restore-only pool stores; live multi-host restore serving remains
+    untested on a physical cluster).
 
 [ ] Decide whether durable Selene manager records are isolated by pool name. A
     manager started with a different --name on the same --root recovers the

@@ -394,8 +394,8 @@ and record use of cache ancestors. Commit validates the plan's epochs and
 resources without rerunning scheduling policy. Completion validation checks
 generations, physical slots, monotonic counters and per-step logical bounds before
 mutating request state.
-Two ordinary decode or complete speculative steps can reference a request
-concurrently; a repeated terminal
+Two ordinary decode, complete speculative, or strictly non-terminal prefill
+steps can reference a request concurrently; a repeated terminal
 completion does not emit its sampled token twice. A CUDA submission failure
 requires confirmed stream drain before `release_after_shutdown` releases
 resources associated with the attempted submission.
@@ -420,7 +420,11 @@ update it with the median of up to nine replay observations. After 30 seconds wi
 the cost becomes stale but remains available for selection. The next valid
 observation replaces the stale estimate. Tensor-parallel observations use the
 maximum positive rank interval, with measured embedding-readiness waits subtracted
-when available. Host delays and queue wait do not enter graph estimates. An
+when available. Executions that drain the queue for completion feedback also
+measure host handoff, which is charged in proportion to the share of the graph's
+last 16 ordinary executions that required completion feedback; pipelined
+executions charge no handoff, probes do not change the share, and queued
+executions exclude queue wait from timing updates. An
 unmeasured candidate ranks ahead of every measured candidate; unmeasured
 candidates compete among themselves by expected useful value. Both
 unmeasured and stale physical dispatches require an empty queue and completion

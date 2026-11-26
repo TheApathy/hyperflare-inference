@@ -62,6 +62,10 @@ impl Binding {
         self.inner.sharded()
     }
 
+    pub fn multi_host_ready(&self) -> bool {
+        self.inner.multi_host_ready()
+    }
+
     pub fn take(&self) -> Option<(Prepared, Vec<std::sync::Arc<Vec<u8>>>)> {
         self.inner
             .take()

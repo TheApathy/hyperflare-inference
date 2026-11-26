@@ -27,7 +27,7 @@ pub(super) const HEADROOM_BYTES: u64 = 64 << 20;
 // buffers took about 1.4 GiB on a DGX Spark. Caches leave room for both beyond the reserve.
 use flare_selene::offload::{
     HOST_SERVICE_HEADROOM_BYTES as INTEGRATED_HOST_BYTES,
-    HOST_SYSTEM_SHARE as INTEGRATED_SYSTEM_SHARE,
+    host_os_reserve_bytes,
 };
 
 #[cfg(any(unix, test))]
@@ -184,11 +184,32 @@ fn headroom(config: &serde_json::Value) -> Result<u64> {
 /// also the server's later host allocations and a twentieth of memory for the system.
 fn budget(free: u64, total: u64, headroom: u64, integrated: bool) -> u64 {
     let host = if integrated {
-        INTEGRATED_HOST_BYTES + total / INTEGRATED_SYSTEM_SHARE
+        host_os_reserve_bytes(total)
     } else {
         0
     };
     free.saturating_sub(headroom.saturating_add(host))
+}
+
+/// Host memory ceiling for pool registration and capture growth.
+///
+/// On integrated UMA devices, the per-rank `budgets` entries already come from the
+/// shared system memory pool after deducting [`host_os_reserve_bytes`], driver headroom,
+/// offload overhead, and `host_future`. Summing the integrated entries avoids charging
+/// the OS reserve a second time while keeping total allocations within the same safety
+/// floor. On discrete GPUs, host RAM is independent of device VRAM and uses `discrete_host`.
+fn unified_host_budget(
+    budgets: &[(u64, bool)],
+    discrete_host: impl FnOnce() -> std::result::Result<u64, String>,
+) -> std::result::Result<u64, String> {
+    if budgets.iter().any(|(_, integrated)| *integrated) {
+        Ok(budgets
+            .iter()
+            .filter(|(_, integrated)| *integrated)
+            .fold(0u64, |sum, (bytes, _)| sum.saturating_add(*bytes)))
+    } else {
+        discrete_host()
+    }
 }
 
 /// Account for loaded storage and observed module/graph growth. The device observation is
@@ -888,19 +909,19 @@ impl NativeModel {
                 ceiling,
                 |_, _| Some(0),
             )?;
-            let host = flare_selene::offload::host_pool_budget(host_future)
-                .map_err(|error| error.to_string());
-            let budget = crate::offload::pool::Budget {
-                host,
-                devices: available
-                    .iter()
-                    .zip(&minimum)
-                    .zip(&self.ranks)
-                    .map(|((&available, &minimum), rank)| {
-                        (available.saturating_sub(minimum), rank.integrated)
-                    })
-                    .collect(),
-            };
+            let devices: Vec<(u64, bool)> = available
+                .iter()
+                .zip(&minimum)
+                .zip(&self.ranks)
+                .map(|((&available, &minimum), rank)| {
+                    (available.saturating_sub(minimum), rank.integrated)
+                })
+                .collect();
+            let host = unified_host_budget(&devices, || {
+                flare_selene::offload::host_pool_budget(host_future)
+                    .map_err(|error| error.to_string())
+            });
+            let budget = crate::offload::pool::Budget { host, devices };
             let uuids = self
                 .ranks
                 .iter()
@@ -932,7 +953,16 @@ impl NativeModel {
         }
         let capture_layout = capture.then(|| flare_selene::Layout::new(&geometry)).transpose()?;
         let host_growth = if capture {
-            flare_selene::offload::host_pool_budget(host_future)?
+            let remaining: Vec<(u64, bool)> = available
+                .iter()
+                .zip(&self.ranks)
+                .map(|(&bytes, rank)| (bytes, rank.integrated))
+                .collect();
+            unified_host_budget(&remaining, || {
+                flare_selene::offload::host_pool_budget(host_future)
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(invalid)?
         } else {
             0
         };
@@ -1506,6 +1536,82 @@ mod tests {
             limited_budget(plentiful, 0, None, HEADROOM_BYTES, true, 0).unwrap(),
             93 * gib - HEADROOM_BYTES
         );
+    }
+
+    #[test]
+    fn unified_uma_os_reserve_is_deducted_once_and_discrete_stays_independent() {
+        let gib = 1u64 << 30;
+        let total = 128 * gib;
+        let free = 100 * gib;
+        let os_reserve = host_os_reserve_bytes(total);
+        assert_eq!(os_reserve, 2 * gib + total / 20);
+
+        let offload_bytes = 64 << 20;
+        let host_future = 4 * gib;
+        let minimum_kv = 2 * gib;
+
+        // Integrated UMA (128 GiB GB10): OS reserve (8.4 GiB) is charged once inside
+        // `limited_budget`; `unified_host_budget` derives pool/capture ceilings from the
+        // unified remaining budget without independently deducting a second 8.4 GiB.
+        let uma_memory = MemorySnapshot { free, total };
+        let uma_future = offload_bytes + host_future;
+        let uma_available = limited_budget(
+            uma_memory,
+            28 * gib,
+            None,
+            HEADROOM_BYTES,
+            true,
+            uma_future,
+        )
+        .unwrap();
+        let expected_uma = free - HEADROOM_BYTES - os_reserve - offload_bytes - host_future;
+        assert_eq!(uma_available, expected_uma);
+
+        let uma_devices = vec![(uma_available - minimum_kv, true)];
+        let uma_pool_host = unified_host_budget(&uma_devices, || {
+            panic!("integrated UMA must not call discrete host_pool_budget a second time")
+        })
+        .unwrap();
+        assert_eq!(uma_pool_host, expected_uma - minimum_kv);
+        // Total possible allocation + preserved OS safety floor never exceeds `free`.
+        assert_eq!(
+            uma_pool_host + minimum_kv + host_future + offload_bytes + HEADROOM_BYTES + os_reserve,
+            free
+        );
+
+        // After pool registration subtracts a 3 GiB host charge, capture growth derives
+        // directly from the remaining unified budget rather than re-deducting 8.4 GiB.
+        let pool_charge = 3 * gib;
+        let uma_after_pool = uma_available - pool_charge;
+        let uma_growth = unified_host_budget(&[(uma_after_pool, true)], || {
+            panic!("integrated UMA capture growth must not re-charge discrete OS reserve")
+        })
+        .unwrap();
+        assert_eq!(uma_growth, expected_uma - pool_charge);
+
+        // Discrete GPU (`integrated = false`): VRAM budget charges zero OS reserve, while
+        // `unified_host_budget` delegates to the separate host RAM budget with its 8.4 GiB reserve.
+        let discrete_memory = MemorySnapshot {
+            free: 24 * gib,
+            total: 32 * gib,
+        };
+        let discrete_available = limited_budget(
+            discrete_memory,
+            8 * gib,
+            None,
+            HEADROOM_BYTES,
+            false,
+            offload_bytes,
+        )
+        .unwrap();
+        assert_eq!(discrete_available, 24 * gib - HEADROOM_BYTES - offload_bytes);
+
+        let discrete_host_ram = flare_selene::offload::host_budget_from(free, total, host_future);
+        assert_eq!(discrete_host_ram, free - host_future - os_reserve);
+        let discrete_devices = vec![(discrete_available - minimum_kv, false)];
+        let resolved_host =
+            unified_host_budget(&discrete_devices, || Ok(discrete_host_ram)).unwrap();
+        assert_eq!(resolved_host, discrete_host_ram);
     }
 
     #[test]

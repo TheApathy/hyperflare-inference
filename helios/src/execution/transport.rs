@@ -964,7 +964,7 @@ impl GraphExecutor {
             &mut self.overlap_scratch,
         )?;
         if !self.can_submit(grammar || !matches!(self.manifest.graphs[graph].kind,
-            GraphKind::Decode | GraphKind::Speculative)) {
+            GraphKind::Decode | GraphKind::Speculative | GraphKind::Prefill)) {
             return Ok(None);
         }
         if crate::engram::consumes(self.manifest.graphs[graph].kind) {
@@ -1017,7 +1017,7 @@ impl GraphExecutor {
                 Error::execution(ExecutionError::State, "graph index out of range")
             })?;
         let grammar_constrained = grammar_constrained
-            || !matches!(graph.kind, GraphKind::Decode | GraphKind::Speculative);
+            || !matches!(graph.kind, GraphKind::Decode | GraphKind::Speculative | GraphKind::Prefill);
         let mut resolved = validate_uploads_indexed(
             &self.manifest,
             &self.index,

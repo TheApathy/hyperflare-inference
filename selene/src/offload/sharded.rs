@@ -153,12 +153,13 @@ fn parse_compression_tag(tag: u8) -> Result<super::KvCompression> {
     }
 }
 
-/// Whether this rank serves a disk store its peers can mirror; a memory tier keeps records in
-/// one process's memory, which other hosts cannot reach.
+/// Whether this rank serves a local disk store its peers can mirror; a memory tier keeps records in
+/// one process's memory, which other hosts cannot reach. Pool-only multi-host stores carry no local
+/// disk shards and coordinate restores directly through the pool client and peer rank agents.
 fn mirrored(prepared: &Prepared) -> Result<bool> {
     if prepared.warm_bytes != 0 {
         return Err(invalid(
-            "a multi-host core keeps host prefix records on disk only; set --prefix-cache-memory 0",
+            "a multi-host core keeps host prefix records on disk or in a pool only; set --prefix-cache-memory 0",
         ));
     }
     Ok(prepared.directory_lock.is_some())
@@ -272,8 +273,13 @@ pub fn join_rank_zero(
             if enabled { "has one" } else { "does not" },
         )));
     }
-    let (Some(listener), Some(prepared)) = (listener, prepared) else {
-        return Ok(None);
+    let (listener, prepared) = match (listener, prepared) {
+        (Some(listener), Some(prepared)) => (listener, prepared),
+        (_, prepared) => {
+            return Ok(prepared
+                .filter(|prepared| prepared.pool_only_multi_host())
+                .map(|_| "pool only across rank processes: restores only".to_owned()));
+        }
     };
     // The limit applies to every host's directory, so the smallest one bounds
     // the records every host can hold.

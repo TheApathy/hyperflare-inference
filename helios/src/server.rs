@@ -21,7 +21,7 @@ mod logprobs;
 mod protocol;
 mod request;
 pub use request::{PreparedRequest, prepare as prepare_request};
-mod runtime;
+pub(crate) mod runtime;
 mod stops;
 #[cfg(feature = "runtime-core")]
 mod session;

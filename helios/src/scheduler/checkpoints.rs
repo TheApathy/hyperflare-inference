@@ -52,6 +52,12 @@ impl CheckpointAccounting {
     pub(super) fn refund_copy(&mut self, cost: u64) {
         self.reserved_ns = self.reserved_ns.saturating_sub(cost);
     }
+
+    pub(super) fn has_cut_at(&self, endpoint: u64) -> bool {
+        self.cuts
+            .iter()
+            .any(|cut| cut.endpoint as u64 == endpoint)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +86,12 @@ pub(super) struct CapturePlan {
     reserve_guard: bool,
     unknown: bool,
     budget: bool,
+}
+
+impl CapturePlan {
+    pub(super) fn has_cut(&self) -> bool {
+        self.cut.is_some()
+    }
 }
 
 fn allowance(work: u64, fraction: f64) -> u64 {
@@ -393,7 +405,7 @@ impl RequestScheduler {
         accounting.cuts.clear();
         accounting.reserved_ns = 0;
         let anchor = request.checkpoint_anchor();
-        let start = request.consumed_tokens as usize;
+        let start = request.prefill_cursor() as usize;
         let (baseline_start, baseline_end) = *accounting.baseline_interval.get_or_insert((
             request.admission_reused_tokens as usize,
             request.prompt_tokens,
@@ -537,11 +549,19 @@ impl RequestScheduler {
     }
 
     pub(super) fn estimated_checkpoint_cut(&self, request: &LiveRequest) -> Option<usize> {
+        self.estimated_checkpoint_cut_from(request, request.prefill_cursor() as usize)
+    }
+
+    pub(super) fn estimated_checkpoint_cut_from(
+        &self,
+        request: &LiveRequest,
+        start: usize,
+    ) -> Option<usize> {
         let (accounting, _, _) = self.checkpoint_selection_cached(request, false);
         accounting
             .cuts
             .iter()
-            .find(|cut| cut.endpoint > request.consumed_tokens as usize)
+            .find(|cut| cut.endpoint > start)
             .map(|cut| cut.endpoint)
     }
 
@@ -550,7 +570,7 @@ impl RequestScheduler {
         accounting
             .cuts
             .iter()
-            .find(|cut| cut.endpoint > request.consumed_tokens as usize)
+            .find(|cut| cut.endpoint > request.prefill_cursor() as usize)
             .map(|cut| cut.endpoint)
     }
 
@@ -574,7 +594,7 @@ impl RequestScheduler {
                 .copied();
             let reserve_guard = cut.is_some_and(|cut| cut.endpoint < anchor)
                 && request.anchor_guard.is_none()
-                && anchor > request.consumed_tokens as usize;
+                && anchor > request.prefill_cursor() as usize;
             let rank = RetentionRank {
                 use_epoch: accounting.demand_epoch,
                 role: cut.map_or(RetentionRole::Endpoint, |cut| cut.role),

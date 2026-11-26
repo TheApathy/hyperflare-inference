@@ -147,7 +147,7 @@ impl RequestScheduler {
         // A prefill stops at the same estimated cut whatever capacity is tried, so it is
         // selected once here rather than once per capacity and mixed shape.
         let cut = if prefill {
-            self.estimated_checkpoint_cut(request)
+            self.estimated_checkpoint_cut_from(request, request.consumed_tokens as usize)
         } else {
             None
         };
@@ -177,15 +177,16 @@ impl RequestScheduler {
             } else {
                 &self.prefill_catalog
             };
-            let terminal_only = self.prefill_requires_terminal_completion(request, cut);
+            let start = request.consumed_tokens as usize;
+            let terminal_only = self.prefill_requires_terminal_completion_from(request, start, cut);
             for &capacity in catalog {
-                let work = self.prefill_work_through(request, capacity, cut);
+                let work = self.prefill_work_from(request, start, capacity, cut);
                 if work == 0 {
                     continue;
                 }
                 let first_output =
                     request.consumed_tokens + work as u64 == request.prompt_tokens as u64;
-                let kind = self.resolve_prefill_kind(request, capacity, work, cut);
+                let kind = self.resolve_prefill_kind_from(request, start, capacity, work, cut);
                 if terminal_only && kind == GraphKind::Prefill {
                     continue;
                 }
@@ -237,7 +238,12 @@ impl RequestScheduler {
                 };
                 let per_ms = 1e6 / ns as f64;
                 if prefill && !request.prompt_logprobs && !request.deferred_prefill {
-                    let work = self.prefill_work_through(request, capacity, cut);
+                    let work = self.prefill_work_from(
+                        request,
+                        request.consumed_tokens as usize,
+                        capacity,
+                        cut,
+                    );
                     if work > 0 {
                         let first =
                             request.consumed_tokens + work as u64 == request.prompt_tokens as u64;

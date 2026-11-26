@@ -326,7 +326,12 @@ fn rank_coordinator_matches_model_pending_window() {
     assert!(!ready_to_commit(&pending[0]));
     assert!(can_submit_pending(&pending, false, &manifest));
     assert!(!can_submit_pending(&pending, true, &manifest));
+    // Non-terminal prefill (`grammar: false`) may share the two-frame window, while
+    // terminal prefill or feedback-gated prefill (`grammar: true`) drains it.
     manifest.graphs[0].kind = GraphKind::Prefill;
+    assert!(can_submit_pending(&pending, false, &manifest));
+    assert!(!can_submit_pending(&pending, true, &manifest));
+    manifest.graphs[0].kind = GraphKind::TerminalPrefill;
     assert!(!can_submit_pending(&pending, false, &manifest));
     manifest.graphs[0].kind = GraphKind::Speculative;
     assert!(can_submit_pending(&pending, false, &manifest));
@@ -405,4 +410,62 @@ fn rank_coordinator_matches_model_partial_dispatch() {
             }
         }
     }
+}
+
+#[test]
+fn non_terminal_prefill_pipelines_two_frames_with_queued_flag() {
+    let mut manifest = manifest();
+    manifest.graphs[0].kind = GraphKind::Prefill;
+    manifest.graphs[1].kind = GraphKind::Prefill;
+    let mut pending = VecDeque::new();
+
+    // First non-terminal prefill chunk enters an empty queue (`queued == false`).
+    assert!(can_submit_pending(&pending, false, &manifest));
+    let mut first = frame(1, 0, false);
+    first.queued = !pending.is_empty();
+    assert!(!first.queued);
+    pending.push_back(first);
+
+    // Second frame must wait until the first is committed across ranks.
+    assert!(!can_submit_pending(&pending, false, &manifest));
+    record_ready(&mut pending, 0, Fence(1), 0).unwrap();
+    record_ready(&mut pending, 1, Fence(1), 0).unwrap();
+    assert!(ready_to_commit(&pending[0]));
+    pending[0].committed = true;
+
+    // A terminal prefill chunk (`barrier == true`) cannot queue behind it, while a
+    // second non-terminal prefill chunk (`barrier == false`) queues with `queued == true`.
+    assert!(!can_submit_pending(&pending, true, &manifest));
+    assert!(can_submit_pending(&pending, false, &manifest));
+    let mut second = frame(2, 1, false);
+    second.queued = !pending.is_empty();
+    assert!(second.queued);
+    pending.push_back(second);
+
+    // Window is full at two frames until the front completes and pops.
+    assert!(!can_submit_pending(&pending, false, &manifest));
+    record_ready(&mut pending, 0, Fence(2), 1).unwrap();
+    record_ready(&mut pending, 1, Fence(2), 1).unwrap();
+    pending[1].committed = true;
+    assert!(!can_submit_pending(&pending, false, &manifest));
+
+    record_local_completion(&mut pending, completion(1, 0)).unwrap();
+    record_peer_completion(&mut pending, 0, completion(1, 0)).unwrap();
+    record_peer_completion(&mut pending, 1, completion(1, 0)).unwrap();
+    let done_first = pop_completed_front(&mut pending).unwrap();
+    assert!(!done_first.queued);
+    assert!(can_submit_pending(&pending, false, &manifest));
+
+    record_local_completion(&mut pending, completion(2, 1)).unwrap();
+    record_peer_completion(&mut pending, 0, completion(2, 1)).unwrap();
+    record_peer_completion(&mut pending, 1, completion(2, 1)).unwrap();
+    let done_second = pop_completed_front(&mut pending).unwrap();
+    assert!(done_second.queued);
+    assert!(pending.is_empty());
+
+    // A feedback-gated prefill (`grammar == true`) blocks queueing behind it.
+    let mut terminal = frame(3, 0, true);
+    terminal.committed = true;
+    pending.push_back(terminal);
+    assert!(!can_submit_pending(&pending, false, &manifest));
 }

@@ -260,7 +260,7 @@ impl TensorParallelExecutor {
             return Err(invalid("tensor-parallel executor is closed"));
         }
         let barrier = grammar || !matches!(self.local.manifest().graphs.get(graph).map(|g| g.kind),
-            Some(super::GraphKind::Decode | super::GraphKind::Speculative));
+            Some(super::GraphKind::Decode | super::GraphKind::Speculative | super::GraphKind::Prefill));
         if !self.can_submit(barrier) { return Ok(None); }
         let Some(fence) = self.local.validate_submission(graph, uploads, grammar)? else {
             return Ok(None);

@@ -87,7 +87,6 @@ pub(super) struct Candidate {
     pub work: usize,
     pub duration_ns: u64,
     pub rate: ValueRate,
-    pub feedback: bool,
     pub host_lengths: Option<[usize; REQUEST_LANES]>,
 }
 
@@ -306,10 +305,14 @@ impl RequestScheduler {
             return false;
         }
         if request.pending > 0
-            && !(request.phase == RequestPhase::Decode
+            && !((request.phase == RequestPhase::Decode
                 && request.pending < 2
                 && !request.grammar_constrained
                 && !request.host_stops)
+                || (request.phase == RequestPhase::Prefill
+                    && request.pending < 2
+                    && !request.prompt_logprobs
+                    && request.scheduled_consumed < request.prompt_tokens as u64))
         {
             return false;
         }
@@ -336,7 +339,16 @@ impl RequestScheduler {
     }
 
     pub(super) fn prefill_work_through(&self, request: &LiveRequest, capacity: usize, cut: Option<usize>) -> usize {
-        let start = request.consumed_tokens as usize;
+        self.prefill_work_from(request, request.prefill_cursor() as usize, capacity, cut)
+    }
+
+    pub(super) fn prefill_work_from(
+        &self,
+        request: &LiveRequest,
+        start: usize,
+        capacity: usize,
+        cut: Option<usize>,
+    ) -> usize {
         let mut end = cut
             .unwrap_or(request.prompt_tokens)
             .min(start.saturating_add(capacity))
@@ -504,7 +516,7 @@ impl RequestScheduler {
                 best = Some((rate, work));
             }
         };
-        if r.consumed_tokens < r.prompt_tokens as u64 {
+        if r.prefill_cursor() < r.prompt_tokens as u64 {
             let catalog = self.prefill_catalog(r.prefill_kind());
             let cut = self.estimated_checkpoint_cut(r);
             let terminal_only = self.prefill_requires_terminal_completion(r, cut);
@@ -530,7 +542,7 @@ impl RequestScheduler {
                         ns,
                         value.prefill(
                             work,
-                            r.consumed_tokens + work as u64 == r.prompt_tokens as u64,
+                            r.prefill_cursor() + work as u64 == r.prompt_tokens as u64,
                         ),
                     );
                 }
@@ -921,7 +933,7 @@ impl RequestScheduler {
         match kind {
             GraphKind::Prefill | GraphKind::TerminalPrefill | GraphKind::ScoredPrefill => value.prefill(
                 tokens,
-                r.consumed_tokens + tokens as u64 == r.prompt_tokens as u64,
+                r.prefill_cursor() + tokens as u64 == r.prompt_tokens as u64,
             ),
             GraphKind::Decode | GraphKind::Speculative => value.decode(
                 self.expected_speculative_tokens(r, tokens),
@@ -991,21 +1003,6 @@ impl RequestScheduler {
             .sum();
         let drafts = if kind == GraphKind::Speculative { capacity - 1 } else { 0 };
         let packed = if kind == GraphKind::Speculative { batch * capacity } else { 0 };
-        let feedback = !self.costs.is_fresh(cost::Key { drafts,
-            kind, batch, tokens: capacity, prefill: 0, packed,
-        })
-            || !matches!(kind, GraphKind::Decode | GraphKind::Speculative)
-            || bits(selected).any(|slot| {
-                let r = self.slots[slot].request.as_ref().unwrap();
-                r.grammar_constrained
-                    || r.host_stops
-                    || (kind.is_prefill()
-                        && (r.consumed_tokens + self.prefill_work(r, capacity) as u64
-                            == r.prompt_tokens as u64
-                            || r.message_boundaries.binary_search(
-                                &(r.consumed_tokens as usize + self.prefill_work(r, capacity)),
-                            ).is_ok()))
-            });
         let (selected, rate) = self
             .continuation_candidate(
                 kind,
@@ -1036,7 +1033,6 @@ impl RequestScheduler {
             },
             duration_ns,
             rate,
-            feedback,
         });
     }
 
@@ -1200,7 +1196,6 @@ impl RequestScheduler {
                     work: 0,
                     duration_ns,
                     rate: ValueRate::new(duration_ns, expected, age_price),
-                    feedback: true,
                 });
             }
         }
@@ -1438,7 +1433,7 @@ impl RequestScheduler {
                     speculative: !self.speculative_widths.is_empty(),
                 }),
                 lanes,
-                requires_feedback: candidate.feedback,
+                requires_feedback: false,
             },
         };
         plan.checkpoint_plans = self.plan_checkpoints(&plan.step);

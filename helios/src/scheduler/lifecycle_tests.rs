@@ -719,3 +719,272 @@ fn scheduler_matches_lifecycle_model() {
         edges.len()
     );
 }
+
+fn prefill_pipeline_scheduler() -> RequestScheduler {
+    let mut s = tests::scheduler(2, 512, 64);
+    let mut graphs = tests::duration_graphs(2);
+    for graph in &mut graphs {
+        graph.estimated_duration_ns = 1_000_000;
+    }
+    s.measured_graph_durations(&graphs).unwrap();
+    s
+}
+
+fn prefill_record(
+    handle: RequestHandle,
+    fence: u64,
+    consumed: i64,
+    status: i64,
+    error_code: i64,
+) -> Vec<CompletionRecord> {
+    let mut records = vec![CompletionRecord::default(); 2];
+    records[handle.slot as usize] = CompletionRecord {
+        generation: handle.generation as i64,
+        submission_sequence: fence as i64,
+        status,
+        error_code,
+        consumed_tokens: consumed,
+        generated_tokens: 0,
+        token_id: -1,
+        ..Default::default()
+    };
+    records
+}
+
+fn timing_with_queued(gpu_ns: u64, wall_ns: u64, queued: bool) -> crate::execution::ExecutionTiming {
+    let mut gpus = [None; 16];
+    gpus[0] = Some(gpu_ns);
+    crate::execution::ExecutionTiming {
+        gpu_ns: gpus,
+        readiness: None,
+        wall_ns,
+        queued,
+    }
+}
+
+#[test]
+fn non_terminal_prefill_advances_cursor_reserves_pages_and_stops_at_terminal_chunk() {
+    let mut s = prefill_pipeline_scheduler();
+    let handle = s.admit(tests::spec(1400, 16)).unwrap();
+    let init = s.plan().unwrap();
+    assert_eq!(init.kind, GraphKind::Init);
+    s.commit(&init, Fence(1)).unwrap();
+    s.complete(
+        Fence(1),
+        &completion_records(&s, Fence(1)),
+        timing_with_queued(1_000_000, 1_100_000, false),
+    )
+    .unwrap();
+
+    // First non-terminal prefill chunk: [0, 512).
+    let first = s.plan().unwrap();
+    assert_eq!((first.kind, first.token_capacity), (GraphKind::Prefill, 512));
+    assert_eq!((first.lanes[0].start_position, first.lanes[0].tokens), (0, 512));
+    assert!(!first.requires_feedback);
+    assert!(!s.plan_requires_feedback(&first));
+    s.commit(&first, Fence(2)).unwrap();
+    {
+        let req = s.request(handle).unwrap();
+        assert_eq!((req.pending, req.consumed_tokens, req.scheduled_consumed), (1, 0, 512));
+        assert_eq!(req.private_pages.len(), 512usize.div_ceil(64));
+    }
+
+    // Second non-terminal prefill chunk queues behind the first: [512, 1024).
+    let second = s.plan().unwrap();
+    assert_eq!((second.kind, second.token_capacity), (GraphKind::Prefill, 512));
+    assert_eq!((second.lanes[0].start_position, second.lanes[0].tokens), (512, 512));
+    assert!(!second.requires_feedback);
+    assert!(!s.plan_requires_feedback(&second));
+    s.commit(&second, Fence(3)).unwrap();
+    {
+        let req = s.request(handle).unwrap();
+        assert_eq!((req.pending, req.consumed_tokens, req.scheduled_consumed), (2, 0, 1024));
+        assert_eq!(req.private_pages.len(), 1024usize.div_ceil(64));
+        assert_eq!(req.last_use, Fence(3));
+    }
+    // Window is full at two queued frames.
+    assert!(s.plan().is_none());
+
+    // Complete first chunk; remaining chunk [1024, 1400) is terminal and must wait for Fence(3).
+    s.complete(
+        Fence(2),
+        &prefill_record(handle, 2, 512, 1, 0),
+        timing_with_queued(1_000_000, 1_100_000, false),
+    )
+    .unwrap();
+    {
+        let req = s.request(handle).unwrap();
+        assert_eq!((req.pending, req.consumed_tokens, req.scheduled_consumed), (1, 512, 1024));
+    }
+    assert!(
+        s.plan().is_none(),
+        "terminal prefill chunk must drain the queued non-terminal frame before submission"
+    );
+
+    // Complete second queued chunk; terminal chunk is now ready with requires_feedback = true.
+    s.complete(
+        Fence(3),
+        &prefill_record(handle, 3, 1024, 1, 0),
+        timing_with_queued(1_000_000, 2_000_000, true),
+    )
+    .unwrap();
+    let terminal = s.plan().unwrap();
+    assert_eq!(terminal.kind, GraphKind::Prefill);
+    assert_eq!(
+        (terminal.lanes[0].start_position, terminal.lanes[0].tokens),
+        (1024, 376)
+    );
+    assert!(terminal.requires_feedback);
+    assert!(s.plan_requires_feedback(&terminal));
+}
+
+#[test]
+fn non_terminal_prefill_drains_at_checkpoint_cut_vision_boundary_and_completion_inputs() {
+    // 1. Checkpoint cut boundary at 1024: [0, 512) pipelines, [512, 1024) drains.
+    let mut s = prefill_pipeline_scheduler();
+    let mut spec = tests::spec(1600, 16);
+    spec.message_boundaries = vec![1024];
+    let handle = s.admit(spec).unwrap();
+    let init = s.plan().unwrap();
+    s.commit(&init, Fence(1)).unwrap();
+    s.complete(Fence(1), &completion_records(&s, Fence(1)), timing_with_queued(1_000_000, 1_000_000, false))
+        .unwrap();
+    let first = s.plan().unwrap();
+    assert_eq!((first.lanes[0].start_position, first.lanes[0].tokens), (0, 512));
+    assert!(!first.requires_feedback);
+    s.commit(&first, Fence(2)).unwrap();
+    assert!(
+        s.plan().is_none(),
+        "chunk ending at a checkpoint cut must drain the preceding non-terminal prefill"
+    );
+    s.complete(Fence(2), &prefill_record(handle, 2, 512, 1, 0), timing_with_queued(1_000_000, 1_000_000, false))
+        .unwrap();
+    let cut_chunk = s.plan().unwrap();
+    assert_eq!((cut_chunk.lanes[0].start_position, cut_chunk.lanes[0].tokens), (512, 512));
+    assert!(cut_chunk.requires_feedback);
+
+    // 2. Vision window boundary at 1024: [0, 512) pipelines, [512, 1024) drains.
+    let mut vision = prefill_pipeline_scheduler();
+    let handle = vision.admit(tests::spec(1600, 16)).unwrap();
+    vision.request_mut(handle).unwrap().conditioned_windows = std::collections::VecDeque::from([
+        ConditionedWindow {
+            inputs: 0..1,
+            token_start: 0,
+            prefill_end: 1024,
+            features: Vec::new(),
+            patches: VecDeque::new(),
+        },
+        ConditionedWindow {
+            inputs: 1..2,
+            token_start: 1024,
+            prefill_end: 1600,
+            features: Vec::new(),
+            patches: VecDeque::new(),
+        },
+    ]);
+    let init = vision.plan().unwrap();
+    vision.commit(&init, Fence(1)).unwrap();
+    vision
+        .complete(Fence(1), &completion_records(&vision, Fence(1)), timing_with_queued(1_000_000, 1_000_000, false))
+        .unwrap();
+    let first = vision.plan().unwrap();
+    assert_eq!((first.lanes[0].start_position, first.lanes[0].tokens), (0, 512));
+    assert!(!first.requires_feedback);
+    vision.commit(&first, Fence(2)).unwrap();
+    assert!(
+        vision.plan().is_none(),
+        "chunk ending at a vision window boundary must drain the preceding prefill"
+    );
+    vision
+        .complete(Fence(2), &prefill_record(handle, 2, 512, 1, 0), timing_with_queued(1_000_000, 1_000_000, false))
+        .unwrap();
+    let window_end = vision.plan().unwrap();
+    assert_eq!((window_end.lanes[0].start_position, window_end.lanes[0].tokens), (512, 512));
+    assert!(window_end.requires_feedback);
+
+    // 3. Completion-fed input on Prefill forces feedback even for a non-terminal chunk.
+    let mut fed = prefill_pipeline_scheduler();
+    fed.capabilities.completion_inputs.push((
+        (GraphKind::Prefill, 1, 0, 512, 0, 0),
+        vec!["consumed_tokens".into()],
+    ));
+    let _handle = fed.admit(tests::spec(1600, 16)).unwrap();
+    let init = fed.plan().unwrap();
+    fed.commit(&init, Fence(1)).unwrap();
+    fed.complete(Fence(1), &completion_records(&fed, Fence(1)), timing_with_queued(1_000_000, 1_000_000, false))
+        .unwrap();
+    let chunk = fed.plan().unwrap();
+    assert_eq!((chunk.kind, chunk.lanes[0].tokens), (GraphKind::Prefill, 512));
+    assert!(chunk.requires_feedback);
+    fed.commit(&chunk, Fence(2)).unwrap();
+    assert!(fed.plan().is_none());
+}
+
+#[test]
+fn non_terminal_prefill_cancellation_and_error_drain_preserve_fenced_page_ownership() {
+    // 1. Cancellation with two queued non-terminal prefill frames holds pages through Fence(3).
+    let mut s = prefill_pipeline_scheduler();
+    let initial_free = s.stats().free_pages;
+    let handle = s.admit(tests::spec(1600, 16)).unwrap();
+    let init = s.plan().unwrap();
+    s.commit(&init, Fence(1)).unwrap();
+    s.complete(Fence(1), &completion_records(&s, Fence(1)), timing_with_queued(1_000_000, 1_000_000, false))
+        .unwrap();
+    let first = s.plan().unwrap();
+    s.commit(&first, Fence(2)).unwrap();
+    let second = s.plan().unwrap();
+    s.commit(&second, Fence(3)).unwrap();
+    let free_while_active = s.stats().free_pages;
+    assert!(free_while_active < initial_free);
+
+    s.cancel(handle).unwrap();
+    assert_eq!(s.stats().free_pages, free_while_active, "cancel cannot free in-flight pages");
+    s.complete(Fence(2), &prefill_record(handle, 2, 512, 1, 0), timing_with_queued(1_000_000, 1_000_000, false))
+        .unwrap();
+    assert_eq!(
+        s.stats().free_pages,
+        free_while_active,
+        "pages must remain fenced until the second queued prefill completes"
+    );
+    s.complete(Fence(3), &prefill_record(handle, 3, 1024, 1, 0), timing_with_queued(1_000_000, 1_000_000, true))
+        .unwrap();
+    assert_eq!(s.stats().free_pages, initial_free);
+
+    // 2. Device error on Frame 1 drains Frame 2 safely and keeps request in Finishing.
+    for second_status in [2, 3] {
+        let mut err_s = prefill_pipeline_scheduler();
+        let initial_free = err_s.stats().free_pages;
+        let handle = err_s.admit(tests::spec(1600, 16)).unwrap();
+        let init = err_s.plan().unwrap();
+        err_s.commit(&init, Fence(1)).unwrap();
+        err_s.complete(Fence(1), &completion_records(&err_s, Fence(1)), timing_with_queued(1_000_000, 1_000_000, false))
+            .unwrap();
+        let first = err_s.plan().unwrap();
+        err_s.commit(&first, Fence(2)).unwrap();
+        let second = err_s.plan().unwrap();
+        err_s.commit(&second, Fence(3)).unwrap();
+
+        err_s
+            .complete(
+                Fence(2),
+                &prefill_record(handle, 2, 0, 3, 7),
+                timing_with_queued(1_000_000, 1_000_000, false),
+            )
+            .unwrap();
+        assert_eq!(err_s.request(handle).unwrap().phase, RequestPhase::Finishing);
+        assert_eq!(err_s.request(handle).unwrap().error_code, Some(7));
+        assert!(err_s.finish(handle).is_err(), "finish must wait for Fence(3)");
+
+        err_s
+            .complete(
+                Fence(3),
+                &prefill_record(handle, 3, 0, second_status, 7),
+                timing_with_queued(1_000_000, 1_000_000, true),
+            )
+            .unwrap();
+        assert_eq!(err_s.request(handle).unwrap().phase, RequestPhase::Finishing);
+        assert_eq!(err_s.request(handle).unwrap().pending, 0);
+        err_s.finish(handle).unwrap();
+        assert_eq!(err_s.stats().free_pages, initial_free);
+    }
+}
