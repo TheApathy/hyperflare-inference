@@ -11,8 +11,11 @@ import re
 from pathlib import Path
 
 _WORKER_BYTES = 2 << 30
-# Conservative concurrency estimate; complete-forward tracing can outgrow kernel tuning workers.
+# Conservative concurrency estimate for discrete multi-rank hosts compiling large forwards.
 FORWARD_WORKER_BYTES = 32 << 30
+# Host-RAM allowance per worker on integrated UMA hosts (paired with _WORKER_DEVICE_BYTES = 2 GiB
+# for 8 GiB total unified memory per compile_threads=1 worker).
+INTEGRATED_FORWARD_WORKER_BYTES = 6 << 30
 _HEADROOM_BYTES = 8 << 30
 # Kernel modules and temporary compiler objects retained by each tuning rank.
 _TUNING_GROWTH_BYTES = 1 << 30

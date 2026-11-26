@@ -11,10 +11,15 @@ import torch
 
 from ignition.progress import graph_catalog, phase
 
-from .aot import ForwardCache, allocation_order
+from .aot import (
+    BindingMismatch, BoundForward, ForwardCache, _completed, _guard_code_cache,
+    allocation_order, aot_forward,
+)
 from .collectives import warmup_wait
 from .compilation import _defer_full_collection
 from .runtime_core import capture_graph, instantiate_graph, record_export_graph
+
+_REAL_FORWARD_CACHE = ForwardCache
 
 
 _warmup_streams = {}
@@ -70,9 +75,194 @@ def _seed_warmup_workspaces(stream, device):
     stream.synchronize()
 
 
+def _is_integrated_device(device, warmup_storage=None):
+    """Report whether the target CUDA device shares unified host/device memory."""
+    integrated = getattr(warmup_storage, "integrated", None)
+    if integrated is not None:
+        return bool(integrated)
+    target = torch.device(device)
+    if target.type != "cuda":
+        return False
+    try:
+        return bool(torch.cuda.get_device_properties(target).is_integrated)
+    except Exception:
+        return False
+
+
 def _capture_order(names, compiled, coordinator):
-    sizes = {name: forward.capture_allocation_sizes for name, forward in compiled.items()}
+    sizes = {name: getattr(forward, "capture_allocation_sizes", ()) for name, forward in compiled.items()}
     return allocation_order(names, sizes, coordinator)
+
+
+def _capture_one(name, function, *, is_compiled, device, stream, warm, pool, session,
+                 collective, coordinator, retain_graphs, warmup_storage, before_run,
+                 retain_forwards, progress, stage):
+    if coordinator is not None:
+        coordinator.barrier(f"capture {name}", coordinator.ranks)
+    started = monotonic()
+    stream.wait_stream(torch.cuda.current_stream(device))
+    exporting = retain_graphs and warmup_storage is not None
+    graph = torch.cuda.CUDAGraph(keep_graph=True) if exporting else capture_graph(retain_graphs=retain_graphs)
+    communication = nullcontext() if collective is None else collective.capture(stream=stream)
+
+    def memory_detail():
+        free, total = torch.cuda.mem_get_info(device)
+        allocated = torch.cuda.memory_allocated(device)
+        reserved = torch.cuda.memory_reserved(device)
+        return (f"{free / (1 << 20):.0f} MiB free, "
+                f"{allocated / (1 << 20):.0f} MiB allocated, "
+                f"{reserved / (1 << 20):.0f} MiB reserved, "
+                f"{(total - free - reserved) / (1 << 20):.0f} MiB outside PyTorch")
+
+    try:
+        if progress is not None:
+            progress(f"capturing {name}: {memory_detail()}")
+        if before_run is not None:
+            warm.wait_stream(stream)
+            with torch.cuda.stream(warm):
+                before_run(name)
+            stream.wait_stream(warm)
+        with communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
+            function()
+        if exporting:
+            graph = record_export_graph(graph, warmup_storage, owners=(function,))
+        elif retain_graphs:
+            if progress is not None:
+                progress(f"instantiating {name}: {memory_detail()}")
+            instantiate_graph(graph)
+    except Exception as error:
+        error.add_note(f"Graph {name!r} on {device}: {memory_detail()}")
+        raise
+    if is_compiled and not retain_forwards:
+        function.retire_after_capture()
+    stage.update(advance=1)
+    if progress is not None:
+        cached = " (compiled cache hit)" if is_compiled and function.cache_hit else ""
+        progress(f"captured {name} in {monotonic() - started:.2f}s{cached}")
+    return graph
+
+
+def _stream_compiled_capture(cache, functions, forwards, signatures, names, *, device, stream, warm,
+                             pool, session, collective, materialize, progress, label, retain_graphs,
+                             warmup_storage, warmup, before_run):
+    """Compile the catalog, then load, warm, capture, and retire one compiled forward at a time.
+
+    Integrated UMA hosts share physical memory between Python guard trees, transient warmup pools,
+    and the retained CUDA graph pool. Streaming keeps at most one compiled forward's guards and
+    Python wrapper live during capture while preserving allocation-descending capture order,
+    warmup/capture stream separation, and canonical Inductor kernel selection sharing.
+    """
+    from .compile_pool import CompilePool
+    from .host_memory import release_unused
+    from .inductor_tuning import InductorSelections
+
+    graphs, compiled = {}, {}
+    cache_hits, paths, pending = {}, {}, []
+    with cache._publication_lock(), torch._inductor.config.patch(compile_threads=1):
+        with phase(progress, "Compile model forwards", total=len(forwards)) as stage, CompilePool(
+            cache.device, headroom_bytes=cache.headroom_bytes, options=cache.options,
+            compile_workers=cache.compile_workers,
+        ) as compiler:
+            def finish():
+                name, bound, path = _completed(pending)
+                try:
+                    with _guard_code_cache(cache.root / "guards"):
+                        if bound.pending is not None:
+                            bound.pending.result()
+                            cache_hits[name] = False
+                        else:
+                            cache_hits[name] = bool(bound.cache_hit)
+                        paths[name] = path
+                except Exception as error:
+                    raise RuntimeError(f"failed to prepare compiled forward {name}") from error
+                stage.update(advance=1)
+
+            for name, forward in forwards.items():
+                warm.wait_stream(torch.cuda.current_stream(device))
+                warm.wait_stream(stream)
+                with _guard_code_cache(cache.root / "guards"), torch.cuda.stream(warm):
+                    bound, path = cache._prepare(
+                        forward, name=name, signature=signatures[name], compiler=compiler,
+                        deferred=materialize is not None,
+                        before_run=None if before_run is None else lambda name=name: before_run(name),
+                    )
+                if bound.pending is None:
+                    # Drop the restored wrapper immediately; streaming reloads one forward at a time.
+                    bound = BoundForward(None, forward, bound.cache_hit)
+                    release_unused(generation=0)
+                pending.append((name, bound, path))
+                if len(pending) >= compiler.workers:
+                    finish()
+            while pending:
+                finish()
+        release_unused()
+        if materialize is not None:
+            materialize()
+        sizes = {name: cache._allocation_sizes(paths[name]) for name in forwards}
+        ordered_names = allocation_order(names, sizes)
+        uncompiled_names = tuple(name for name in names if name not in forwards)
+        if uncompiled_names:
+            with phase(progress, "Warm serving graphs", total=len(uncompiled_names)) as stage:
+                for name in uncompiled_names:
+                    warm.wait_stream(torch.cuda.current_stream(device))
+                    warm.wait_stream(stream)
+                    with warmup(), torch.cuda.stream(warm):
+                        if before_run is not None:
+                            before_run(name)
+                        functions[name]()
+                    warm.synchronize()
+                    stage.update(advance=1)
+        selections = InductorSelections(cache.device, lock_gpu_clocks=cache.lock_gpu_clocks,
+                                        source_identity=cache.root.name)
+        with phase(progress, label, total=len(names)) as stage:
+            for name in ordered_names:
+                if name in forwards:
+                    forward = forwards[name]
+                    run_before = None if before_run is None else lambda name=name: before_run(name)
+                    try:
+                        with _guard_code_cache(cache.root / "guards"):
+                            warm.wait_stream(torch.cuda.current_stream(device))
+                            warm.wait_stream(stream)
+                            with torch.cuda.stream(warm):
+                                try:
+                                    bound = cache._load(forward, paths[name], required=True,
+                                                        before_run=run_before)
+                                except BindingMismatch:
+                                    if materialize is None:
+                                        raise
+                                    bound = BoundForward(aot_forward(forward, options=cache.options), forward, False)
+                                else:
+                                    bound.cache_hit = cache_hits[name]
+                            with warmup_wait(collective, None), torch.cuda.stream(warm):
+                                bound = cache._warm(bound, paths[name], name=name, progress=None,
+                                                    selections=selections, warmup=warmup,
+                                                    before_run=run_before)
+                            warm.synchronize()
+                            bound.prepare_capture()
+                            selections.release(bound)
+                    except Exception as error:
+                        if materialize is None:
+                            raise RuntimeError(f"failed to prepare compiled forward {name}") from error
+                        raise
+                    stream.wait_stream(warm)
+                    graphs[name] = _capture_one(
+                        name, bound, is_compiled=True, device=device, stream=stream, warm=warm,
+                        pool=pool, session=session, collective=collective, coordinator=None,
+                        retain_graphs=retain_graphs, warmup_storage=warmup_storage,
+                        before_run=before_run, retain_forwards=False, progress=progress, stage=stage,
+                    )
+                    compiled[name] = bound
+                else:
+                    stream.wait_stream(warm)
+                    graphs[name] = _capture_one(
+                        name, functions[name], is_compiled=False, device=device, stream=stream, warm=warm,
+                        pool=pool, session=session, collective=collective, coordinator=None,
+                        retain_graphs=retain_graphs, warmup_storage=warmup_storage,
+                        before_run=before_run, retain_forwards=False, progress=progress, stage=stage,
+                    )
+    torch.cuda.synchronize(device)
+    release_unused()
+    return graphs, compiled
 
 
 @_defer_full_collection()
@@ -87,8 +277,12 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     Persistent state and graph outputs must live in caller-owned storage.
     Only graph-local intermediates may use the shared graph memory pool;
     serving replays variants serially and may choose them in any order.
-    All eager warmups precede capture so their transient workspaces do not
-    coexist with retained graph intermediates.
+    On discrete GPUs, all eager warmups precede capture so their transient
+    workspaces do not coexist with retained graph intermediates. On single-rank
+    integrated UMA GPUs when ``retain_forwards`` is false, compiled forwards
+    stream one at a time (load, warm inside transient storage, capture, and
+    retire guards) so peak host/UMA memory does not retain every forward's
+    guard tree simultaneously.
     Graphs captured on one stream share that stream's cached workspace;
     resetting any of them frees the workspace the others still reference.
     Callers must reset all of a capture stream's graphs together or keep
@@ -120,6 +314,16 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                              lock_gpu_clocks=getattr(session, "lock_gpu_clocks", False) and session.autotune)
         forwards = {name: function for name, function in functions.items()
                     if name in names and signatures[name].kind in compile_kinds}
+        if (forwards and coordinator is None and not retain_forwards
+                and isinstance(cache, _REAL_FORWARD_CACHE)
+                and _is_integrated_device(device, warmup_storage)):
+            return _stream_compiled_capture(
+                cache, functions, forwards, signatures, names, device=device, stream=stream,
+                warm=warm, pool=pool, session=session, collective=collective,
+                materialize=materialize, progress=progress, label=label,
+                retain_graphs=retain_graphs, warmup_storage=warmup_storage,
+                warmup=warmup, before_run=before_run,
+            )
         warm.wait_stream(torch.cuda.current_stream(device))
         warm.wait_stream(stream)
         retention = nullcontext() if warmup_storage is None else warmup_storage.retain_transient_backing()
@@ -163,47 +367,11 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     with phase(progress, label, total=len(names)) as stage:
         for name in ordered_names:
             function = compiled.get(name, functions[name])
-            if coordinator is not None:
-                coordinator.barrier(f"capture {name}", coordinator.ranks)
-            started = monotonic()
-            stream.wait_stream(torch.cuda.current_stream(device))
-            exporting = retain_graphs and warmup_storage is not None
-            graph = torch.cuda.CUDAGraph(keep_graph=True) if exporting else capture_graph(retain_graphs=retain_graphs)
-            communication = nullcontext() if collective is None else collective.capture(stream=stream)
-            def memory_detail():
-                free, total = torch.cuda.mem_get_info(device)
-                allocated = torch.cuda.memory_allocated(device)
-                reserved = torch.cuda.memory_reserved(device)
-                return (f"{free / (1 << 20):.0f} MiB free, "
-                        f"{allocated / (1 << 20):.0f} MiB allocated, "
-                        f"{reserved / (1 << 20):.0f} MiB reserved, "
-                        f"{(total - free - reserved) / (1 << 20):.0f} MiB outside PyTorch")
-
-            try:
-                if progress is not None:
-                    progress(f"capturing {name}: {memory_detail()}")
-                if before_run is not None:
-                    warm.wait_stream(stream)
-                    with torch.cuda.stream(warm):
-                        before_run(name)
-                    stream.wait_stream(warm)
-                with communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
-                    function()
-                if exporting:
-                    graph = record_export_graph(graph, warmup_storage, owners=(function,))
-                elif retain_graphs:
-                    if progress is not None:
-                        progress(f"instantiating {name}: {memory_detail()}")
-                    instantiate_graph(graph)
-            except Exception as error:
-                error.add_note(f"Graph {name!r} on {device}: {memory_detail()}")
-                raise
-            if name in compiled and not retain_forwards:
-                function.retire_after_capture()
-            graphs[name] = graph
-            stage.update(advance=1)
-            if progress is not None:
-                cached = " (compiled cache hit)" if name in compiled and compiled[name].cache_hit else ""
-                progress(f"captured {name} in {monotonic() - started:.2f}s{cached}")
+            graphs[name] = _capture_one(
+                name, function, is_compiled=name in compiled, device=device, stream=stream, warm=warm,
+                pool=pool, session=session, collective=collective, coordinator=coordinator,
+                retain_graphs=retain_graphs, warmup_storage=warmup_storage,
+                before_run=before_run, retain_forwards=retain_forwards, progress=progress, stage=stage,
+            )
     torch.cuda.synchronize(device)
     return graphs, compiled

@@ -32,6 +32,16 @@ class CompilerResources:
     limit: int
     worker_bytes: int
     headroom: int
+    min_worker_bytes: int | None = None
+
+    @property
+    def minimum_worker_bytes(self) -> int:
+        if self.min_worker_bytes is not None:
+            return self.min_worker_bytes
+        return min(
+            self.worker_bytes,
+            max(0, self.worker_bytes - host_memory.FORWARD_WORKER_BYTES) + host_memory._WORKER_BYTES,
+        )
 
 
 def compiler_resources(device, *, headroom_bytes=0, options=None, compile_workers=None):
@@ -46,17 +56,27 @@ def compiler_resources(device, *, headroom_bytes=0, options=None, compile_worker
     free = device_memory_info(device)[0]
     shared = torch.cuda.get_device_properties(device).is_integrated
     device_bytes = _WORKER_DEVICE_BYTES if shared else _DISCRETE_WORKER_DEVICE_BYTES
-    if free - headroom_bytes < device_bytes:
+    headroom = max(host_memory._HEADROOM_BYTES, headroom_bytes if shared else 0)
+    min_worker_bytes = host_memory._WORKER_BYTES + (device_bytes if shared else 0)
+    if free - headroom_bytes < device_bytes or (shared and min(available, free) - headroom < min_worker_bytes):
         torch.cuda.empty_cache()
+        available = host_memory.available_bytes()
         free = device_memory_info(device)[0]
     capacity = max(0, (free - headroom_bytes) // device_bytes)
     if compile_workers is None:
         capacity = min(8, capacity)
     if shared:
         available = min(available, free)
-    return CompilerResources(capacity, available, limit,
-        host_memory.FORWARD_WORKER_BYTES + (device_bytes if shared else 0),
-        max(host_memory._HEADROOM_BYTES, headroom_bytes if shared else 0))
+    worker_host_bytes = (host_memory.INTEGRATED_FORWARD_WORKER_BYTES if shared
+                         else host_memory.FORWARD_WORKER_BYTES)
+    return CompilerResources(
+        capacity,
+        available,
+        limit,
+        worker_host_bytes + (device_bytes if shared else 0),
+        headroom,
+        min_worker_bytes,
+    )
 
 
 def allocate_workers(resources, counts, hosts):
@@ -83,8 +103,7 @@ def allocate_workers(resources, counts, hosts):
             # Small forwards can fit below the concurrency estimate. Preserve one worker per host
             # under the minimum allowance without multiplying that allowance by the rank count.
             able = [rank for rank in members if resources[rank].capacity
-                    and resources[rank].worker_bytes - host_memory.FORWARD_WORKER_BYTES
-                    + host_memory._WORKER_BYTES <= remaining]
+                    and resources[rank].minimum_worker_bytes <= remaining]
             if able:
                 workers[able[0]] = 1
             else:

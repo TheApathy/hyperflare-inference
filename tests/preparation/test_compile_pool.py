@@ -13,7 +13,7 @@ from torch._subclasses import FakeTensor
 from ignition.preparation.forward_metadata import dumps, loads
 
 
-@pytest.mark.parametrize("integrated,expected", [(False, 2), (True, 1)])
+@pytest.mark.parametrize("integrated,expected", [(False, 2), (True, 8)])
 def test_compiler_concurrency_accounts_for_shared_device_ram(monkeypatch, integrated, expected):
     from ignition.preparation import compile_pool, host_memory
 
@@ -23,7 +23,7 @@ def test_compiler_concurrency_accounts_for_shared_device_ram(monkeypatch, integr
     monkeypatch.setattr(host_memory, "available_bytes", lambda: 72 << 30)
     monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
     pool = compile_pool.CompilePool("cuda:0")
-    assert pool.workers == expected
+    assert pool.workers == (2 if integrated and host_memory.os.name == "nt" else expected)
     assert pool.options["compile_threads"] == 1
 
 
@@ -382,7 +382,7 @@ def test_compile_pool_sizes_workers_from_free_device_memory(monkeypatch, request
     assert (pool.workers, pool.options["compile_threads"]) == (workers, threads)
 
 
-@pytest.mark.parametrize("integrated,workers,threads", [(False, 2, 1), (True, 1, 1)])
+@pytest.mark.parametrize("integrated,workers,threads", [(False, 2, 1), (True, 8, 1)])
 def test_compiler_reuses_its_budgeted_worker_pool(monkeypatch, tmp_path, integrated, workers, threads):
     from concurrent.futures import Future
     from torch._inductor.compile_worker import subproc_pool
@@ -424,7 +424,7 @@ def test_compiler_reuses_its_budgeted_worker_pool(monkeypatch, tmp_path, integra
     assert executor.closed and compile_pool._OPTIONS["compile_threads"] == 16
 
 
-@pytest.mark.parametrize("integrated,workers", [(False, 2), (True, 1)])
+@pytest.mark.parametrize("integrated,workers", [(False, 2), (True, 7)])
 def test_compilation_preserves_configured_headroom(monkeypatch, integrated, workers):
     from ignition.preparation import compile_pool, host_memory
 
@@ -458,7 +458,7 @@ def test_windows_compiler_workers_fit_host_ram_with_larger_device_budget(monkeyp
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
     monkeypatch.setattr(host_memory, "available_bytes", lambda: 48 << 30)
     pool = compile_pool.CompilePool("cuda:0", headroom_bytes=8 << 30)
-    assert (pool.workers, pool.options["compile_threads"]) == (1, 1)
+    assert (pool.workers, pool.options["compile_threads"]) == (5, 1)
 
 
 def test_host_admission_leaves_zero_worker_ranks_when_ram_cannot_cover_every_owner():
@@ -556,3 +556,109 @@ def test_compiler_does_not_serialize_preparation_session_resources(recorded):
         assert session.resource is token
     finally:
         context.reset(token)
+
+
+@pytest.mark.parametrize(("available_gib", "requested", "expected"), [
+    # 128 GiB GB10 UMA (20 cores): automatic sizing scales up to 8 workers without serializing.
+    (96, None, 8),
+    (72, None, 8),
+    (48, None, 5),
+    (40, None, 4),
+    (36, None, 3),
+    # Smaller UMA hosts and tighter memory states scale down smoothly while preserving 8 GiB headroom.
+    (24, None, 2),
+    (16, None, 1),
+    # Minimum 4 GiB allowance (2 GiB host + 2 GiB device) still admits one serial worker above 8 GiB headroom.
+    (12, None, 1),
+    # Explicit --compile-workers lifts the 8-worker automatic cap while obeying UMA RAM and CPU affinity.
+    (104, 9, 9),
+    (96, 16, 11),
+    (120, 20, 14),
+    (120, 32, 14),
+    (48, 12, 5),
+])
+def test_integrated_uma_compiler_admission_scales_within_headroom_and_affinity(
+    monkeypatch, available_gib, requested, expected
+):
+    from ignition.preparation import compile_pool, host_memory
+
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda _: set(range(20)))
+    monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (available_gib << 30, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: available_gib << 30)
+
+    resources = compile_pool.compiler_resources("cuda:0", compile_workers=requested)
+    assert resources.worker_bytes == host_memory.INTEGRATED_FORWARD_WORKER_BYTES + compile_pool._WORKER_DEVICE_BYTES
+    assert resources.minimum_worker_bytes == host_memory._WORKER_BYTES + compile_pool._WORKER_DEVICE_BYTES
+    pool = compile_pool.CompilePool("cuda:0", compile_workers=requested)
+    assert pool.workers == expected
+    assert pool.options["compile_threads"] == 1
+    if pool.workers > 1:
+        assert pool.workers * resources.worker_bytes + resources.headroom <= available_gib << 30
+    else:
+        assert resources.minimum_worker_bytes + resources.headroom <= available_gib << 30
+
+
+def test_integrated_uma_rejects_admission_below_minimum_allowance_and_headroom(monkeypatch):
+    from ignition.preparation import compile_pool, host_memory
+
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda _: set(range(20)))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (11 << 30, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 11 << 30)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    with pytest.raises(MemoryError, match="no capacity"):
+        compile_pool.CompilePool("cuda:0")
+
+
+def test_integrated_uma_compiler_admission_obeys_cgroup_v2_memory_cap(monkeypatch):
+    from pathlib import Path
+    from ignition.preparation import compile_pool, host_memory
+
+    read_text = Path.read_text
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda _: set(range(20)))
+    monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda path, *args, **kwargs: (
+            f"MemAvailable: {96 << 20} kB\n" if str(path) == "/proc/meminfo" else read_text(path, *args, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (96 << 30, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    # 32 GiB cgroup cap leaves 24 GiB above 8 GiB headroom -> 3 workers at 8 GiB/worker.
+    monkeypatch.setattr(host_memory, "_cgroup_available_bytes", lambda: 32 << 30)
+    assert compile_pool.CompilePool("cuda:0", compile_workers=16).workers == 3
+
+    # Tighter 11 GiB cgroup cap leaves 3 GiB < 4 GiB minimum -> refuses admission instead of OOMing.
+    monkeypatch.setattr(host_memory, "_cgroup_available_bytes", lambda: 11 << 30)
+    with pytest.raises(MemoryError, match="no capacity"):
+        compile_pool.CompilePool("cuda:0", compile_workers=16)
+
+
+def test_integrated_uma_refreshes_available_memory_after_cuda_empty_cache(monkeypatch):
+    from ignition.preparation import compile_pool, host_memory
+
+    state = {"flushed": False}
+
+    def available():
+        return (40 << 30) if state["flushed"] else (10 << 30)
+
+    def flush():
+        state["flushed"] = True
+
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda _: set(range(20)))
+    monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
+    monkeypatch.setattr(host_memory, "available_bytes", available)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (available(), 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(torch.cuda, "empty_cache", flush)
+
+    pool = compile_pool.CompilePool("cuda:0", headroom_bytes=4 << 30)
+    assert state["flushed"] is True
+    assert pool.workers == 4
