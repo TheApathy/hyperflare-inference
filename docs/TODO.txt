@@ -36,11 +36,9 @@
     helios/proto/runtime_core.proto. Validate their original captured graphs
     through native serving without re-export or re-signing.
 
-[ ] Review threaded-rank rejection state in helios/src/execution/threaded.rs
-    and helios/src/execution/threaded/protocol.rs. Duplicate rank-zero completions
-    overwrite stored payloads before rejection; frames leave the queue before
-    agreement and timing validation. Verify ownership and poison handling through
-    poll_ranks and close, beyond the existing bookkeeping-helper tests.
+[ ] Verify threaded-rank and socket-rank ownership and poison handling through
+    poll_ranks and close on real CUDA executors after agreement and timing
+    validation rejections, beyond the queue-publication unit tests.
 
 [ ] Qualify actual threaded executor completion and shutdown on assigned CUDA
     devices after partial Prepare/Commit dispatch, failure after local enqueue,
@@ -102,10 +100,9 @@
 [ ] Validate native runtime-core export on Windows, including unbuffered
     bulk I/O, positioned tails, and cache reuse.
 
-[ ] Resolve fixed external-address core loading collisions: cuInit's
-    randomized 8.0625 GiB host VA reservation can cover a recorded high 1 GiB
-    window. test_core_replays_without_python with fixed_core_fixture.py
-    and exec_handover reproduces with both Python and native exporters.
+[ ] Qualify Linux pre-reservation of fixed MappedHost spans before cuInit(0)
+    against test_core_replays_without_python with fixed_core_fixture.py and
+    exec_handover for both Python and native exporters.
 
 [ ] Qualify retained graph costs and funded remeasurement in live Helios:
     idle/resume, concurrent decode latency, cost-change recovery, and queued

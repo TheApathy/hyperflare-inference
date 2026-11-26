@@ -319,10 +319,14 @@ impl NativeResources {
             ));
         }
         let phase = StartupProgress::silent().phase("Load model", None);
+        // Pre-reserve fixed mapped-host VA spans before `cuInit(0)` so CUDA's
+        // randomized host VA reservation cannot claim recorded host addresses.
+        let host_reservations = MappedHostReservations::reserve(std::slice::from_ref(&core))?;
         let mut owner = unsafe { Self::initialize(&core, ordinal)? };
         unsafe {
             owner.reserve(&core)?;
-            owner.allocate(&core, &phase)?;
+            owner.allocate_with_host_reservations(&core, &phase, Some(&host_reservations))?;
+            drop(host_reservations);
             owner.load_payload(files, &core, &phase, 1)?;
             owner.prepare_kernels(files, &core, &phase, None)?;
             owner.prepare_graphs(files, &core, &phase)?;
@@ -529,7 +533,19 @@ impl NativeResources {
         Ok(())
     }
 
+    #[cfg(test)]
     unsafe fn allocate(&mut self, core: &Core, phase: &Phase) -> Result<()> {
+        unsafe { self.allocate_with_host_reservations(core, phase, None) }
+    }
+
+    unsafe fn allocate_with_host_reservations(
+        &mut self,
+        core: &Core,
+        phase: &Phase,
+        host_reservations: Option<&MappedHostReservations>,
+    ) -> Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = host_reservations;
         #[cfg(windows)]
         if self.host_mappings.is_empty() {
             unsafe { self.allocate_host(core)? };
@@ -613,26 +629,68 @@ impl NativeResources {
                         Memory::MappedHost => {
                             #[cfg(unix)]
                             {
-                                let mapped = libc::mmap(
-                                    address as Handle,
-                                    allocation.nbytes,
-                                    libc::PROT_READ | libc::PROT_WRITE,
-                                    libc::MAP_PRIVATE
-                                        | libc::MAP_ANONYMOUS
-                                        | libc::MAP_FIXED_NOREPLACE,
-                                    -1,
-                                    0,
-                                );
-                                if mapped != address as Handle {
-                                    return Err(invalid(format!(
-                                        "host address collision at {address:#x}: {}",
-                                        std::io::Error::last_os_error()
-                                    )));
-                                }
+                                #[cfg(target_os = "linux")]
+                                let mapping = match host_reservations
+                                    .map(|reservations| {
+                                        reservations.promote(address, allocation.nbytes)
+                                    })
+                                    .transpose()?
+                                    .flatten()
+                                {
+                                    Some(mapping) => mapping,
+                                    None => {
+                                        let mapped = libc::mmap(
+                                            address as Handle,
+                                            allocation.nbytes,
+                                            libc::PROT_READ | libc::PROT_WRITE,
+                                            libc::MAP_PRIVATE
+                                                | libc::MAP_ANONYMOUS
+                                                | libc::MAP_FIXED_NOREPLACE,
+                                            -1,
+                                            0,
+                                        );
+                                        if mapped == libc::MAP_FAILED {
+                                            return Err(invalid(format!(
+                                                "host address collision at {address:#x}: {}",
+                                                std::io::Error::last_os_error()
+                                            )));
+                                        }
+                                        if mapped != address as Handle {
+                                            libc::munmap(mapped, allocation.nbytes);
+                                            return Err(invalid(format!(
+                                                "host address collision at {address:#x}: mapped at {mapped:p}"
+                                            )));
+                                        }
+                                        OwnedHostMapping::from_raw(mapped, allocation.nbytes)
+                                    }
+                                };
+                                #[cfg(target_os = "linux")]
+                                let mapped = mapping.address();
+                                #[cfg(not(target_os = "linux"))]
+                                let mapped = {
+                                    let mapped = libc::mmap(
+                                        address as Handle,
+                                        allocation.nbytes,
+                                        libc::PROT_READ | libc::PROT_WRITE,
+                                        libc::MAP_PRIVATE
+                                            | libc::MAP_ANONYMOUS
+                                            | libc::MAP_FIXED_NOREPLACE,
+                                        -1,
+                                        0,
+                                    );
+                                    if mapped != address as Handle {
+                                        return Err(invalid(format!(
+                                            "host address collision at {address:#x}: {}",
+                                            std::io::Error::last_os_error()
+                                        )));
+                                    }
+                                    mapped
+                                };
                                 // Registration does not pin host memory for an integrated GPU, and a
                                 // swapped-out page turns each GPU access during replay into a fault.
                                 if self.integrated && libc::mlock(mapped, allocation.nbytes) != 0 {
                                     let error = std::io::Error::last_os_error();
+                                    #[cfg(not(target_os = "linux"))]
                                     libc::munmap(mapped, allocation.nbytes);
                                     return Err(invalid(format!(
                                         "cannot lock {} bytes of mapped host storage: {error}; raise RLIMIT_MEMLOCK",
@@ -640,10 +698,13 @@ impl NativeResources {
                                     )));
                                 }
                                 let status = (driver.host_register)(mapped, allocation.nbytes, 2);
+                                #[cfg(not(target_os = "linux"))]
                                 if status != 0 {
                                     libc::munmap(mapped, allocation.nbytes);
                                 }
                                 driver.check("cuMemHostRegister_v2", status)?;
+                                #[cfg(target_os = "linux")]
+                                mapping.release();
                             }
                         }
                         // The owning rank maps peer storage and grants this rank access.
@@ -1585,5 +1646,325 @@ unsafe fn apply_context_settings(
             let _ = (driver.context_set)(previous);
         }
         configured
+    }
+}
+
+/// RAII owner of anonymous `PROT_NONE` Linux VA reservations for fixed
+/// `Memory::MappedHost` spans acquired before `cuInit(0)`.
+///
+/// Promoting a span removes it from this guard and transfers ownership to the
+/// returned [`OwnedHostMapping`]; any unpromoted spans are `munmap`ped on drop.
+#[cfg(target_os = "linux")]
+struct MappedHostReservations {
+    spans: std::sync::Mutex<HashMap<u64, usize>>,
+}
+
+#[cfg(target_os = "linux")]
+struct OwnedHostMapping {
+    addr: Handle,
+    nbytes: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl OwnedHostMapping {
+    fn from_raw(addr: Handle, nbytes: usize) -> Self {
+        Self { addr, nbytes }
+    }
+
+    fn address(&self) -> Handle {
+        self.addr
+    }
+
+    fn release(self) -> Handle {
+        let addr = self.addr;
+        std::mem::forget(self);
+        addr
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for OwnedHostMapping {
+    fn drop(&mut self) {
+        // SAFETY: `self` exclusively owns this anonymous host mapping until
+        // `release` transfers ownership into `NativeResources::allocations`.
+        unsafe {
+            libc::munmap(self.addr, self.nbytes);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl MappedHostReservations {
+    fn reserve(cores: &[Core]) -> Result<Self> {
+        let spans: Vec<(u64, usize)> = cores
+            .iter()
+            .flat_map(|core| &core.allocations)
+            .filter_map(|allocation| {
+                if matches!(allocation.memory, Memory::MappedHost)
+                    && allocation.sizing.is_none()
+                    && allocation.nbytes > 0
+                {
+                    allocation.address.map(|address| (address, allocation.nbytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Self::reserve_spans(&spans)
+    }
+
+    fn reserve_spans(spans: &[(u64, usize)]) -> Result<Self> {
+        let mut reserved = Self {
+            spans: std::sync::Mutex::new(HashMap::with_capacity(spans.len())),
+        };
+        for &(address, nbytes) in spans {
+            if address == 0 || nbytes == 0 {
+                return Err(invalid(format!(
+                    "invalid mapped host reservation ({address:#x}, {nbytes} bytes)"
+                )));
+            }
+            // SAFETY: Anonymous `PROT_NONE` with `MAP_NORESERVE | MAP_FIXED_NOREPLACE`
+            // reserves virtual address space without committing RAM or replacing
+            // existing mappings; dropping `reserved` on error unmaps earlier spans.
+            let mapped = unsafe {
+                libc::mmap(
+                    address as Handle,
+                    nbytes,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE
+                        | libc::MAP_ANONYMOUS
+                        | libc::MAP_NORESERVE
+                        | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(invalid(format!(
+                    "host address collision at {address:#x}: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            if mapped != address as Handle {
+                // SAFETY: `mapped` is a freshly created anonymous mapping of `nbytes`.
+                unsafe {
+                    libc::munmap(mapped, nbytes);
+                }
+                return Err(invalid(format!(
+                    "host address collision at {address:#x}: mapped at {mapped:p}"
+                )));
+            }
+            reserved
+                .spans
+                .get_mut()
+                .expect("fresh reservation mutex is unpoisoned")
+                .insert(address, nbytes);
+        }
+        Ok(reserved)
+    }
+
+    /// Promote a pre-reserved `PROT_NONE` span to `PROT_READ | PROT_WRITE` and
+    /// transfer ownership to the returned [`OwnedHostMapping`].
+    ///
+    /// Returns `Ok(None)` when `address` is not held by this guard.
+    fn promote(&self, address: u64, nbytes: usize) -> Result<Option<OwnedHostMapping>> {
+        let mut spans = self
+            .spans
+            .lock()
+            .expect("host reservation mutex poisoned");
+        let Some(&reserved_bytes) = spans.get(&address) else {
+            return Ok(None);
+        };
+        if reserved_bytes != nbytes {
+            return Err(invalid(format!(
+                "pre-reserved mapped host span at {address:#x} has {reserved_bytes} bytes, expected {nbytes}"
+            )));
+        }
+        spans.remove(&address);
+        drop(spans);
+        let mapping = OwnedHostMapping::from_raw(address as Handle, nbytes);
+        // SAFETY: `mapping` exclusively owns the `PROT_NONE` anonymous mapping
+        // at `(address, nbytes)`; `mprotect` enables CPU and CUDA registration access.
+        if unsafe {
+            libc::mprotect(
+                mapping.address(),
+                nbytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+            )
+        } != 0
+        {
+            return Err(invalid(format!(
+                "cannot enable read/write access on pre-reserved host span at {address:#x}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Some(mapping))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MappedHostReservations {
+    fn drop(&mut self) {
+        let spans = match self.spans.get_mut() {
+            Ok(spans) => spans,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (address, nbytes) in spans.drain() {
+            // SAFETY: Every remaining span is an unpromoted `PROT_NONE` anonymous
+            // mapping exclusively owned by this guard.
+            unsafe {
+                libc::munmap(address as Handle, nbytes);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct MappedHostReservations;
+
+#[cfg(not(target_os = "linux"))]
+impl MappedHostReservations {
+    fn reserve(_cores: &[Core]) -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mapped_host_reservation_tests {
+    use super::*;
+
+    fn host_page_size() -> usize {
+        // SAFETY: `_SC_PAGESIZE` is a constant sysconf query with no preconditions.
+        let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(size > 0, "sysconf(_SC_PAGESIZE) failed: {size}");
+        size as usize
+    }
+
+    /// Obtain a temporary free virtual address window of `pages` host pages by
+    /// probing the kernel and releasing the probe mapping.
+    fn probe_free_window(pages: usize) -> (u64, usize) {
+        let page = host_page_size();
+        let len = pages * page;
+        // SAFETY: Kernel chooses a fresh anonymous `PROT_NONE` mapping.
+        let base = unsafe {
+            libc::mmap(
+                null_mut(),
+                len,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "probe mmap failed");
+        // SAFETY: `base` was just returned by `mmap` with length `len`.
+        assert_eq!(unsafe { libc::munmap(base, len) }, 0, "probe munmap failed");
+        (base as u64, page)
+    }
+
+    fn is_unmapped_for_fixed_noreplace(address: u64, nbytes: usize) -> bool {
+        // SAFETY: `MAP_FIXED_NOREPLACE` fails with `EEXIST` if any page in the
+        // range is mapped and never overwrites an existing mapping.
+        let mapped = unsafe {
+            libc::mmap(
+                address as Handle,
+                nbytes,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE
+                    | libc::MAP_ANONYMOUS
+                    | libc::MAP_NORESERVE
+                    | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return false;
+        }
+        // SAFETY: `mapped` was freshly created above with length `nbytes`.
+        let unmapped = unsafe { libc::munmap(mapped, nbytes) };
+        assert_eq!(unmapped, 0, "probe cleanup munmap failed");
+        mapped == address as Handle
+    }
+
+    #[test]
+    fn prereserve_promote_and_raii_drop_cleanup_without_cuda() {
+        // Retry if another test thread claims the probed window between probe and reserve.
+        let (addr_a, addr_b, page, reservations) = (0..16)
+            .find_map(|_| {
+                let (base, page) = probe_free_window(4);
+                let addr_a = base + page as u64;
+                let addr_b = base + (2 * page) as u64;
+                MappedHostReservations::reserve_spans(&[(addr_a, page), (addr_b, page)])
+                    .ok()
+                    .map(|reservations| (addr_a, addr_b, page, reservations))
+            })
+            .expect("could not reserve two disjoint host test pages");
+
+        // Both spans block conflicting fixed mappings while held by the guard.
+        assert!(!is_unmapped_for_fixed_noreplace(addr_a, page));
+        assert!(!is_unmapped_for_fixed_noreplace(addr_b, page));
+
+        // Promote `addr_a` to read/write and verify ownership transfers once.
+        let mapping_a = reservations
+            .promote(addr_a, page)
+            .unwrap()
+            .expect("pre-reserved span must promote");
+        assert!(
+            reservations.promote(addr_a, page).unwrap().is_none(),
+            "promoted span must not remain in the reservation guard"
+        );
+        // SAFETY: `mapping_a` is promoted to `PROT_READ | PROT_WRITE` for `page` bytes.
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(mapping_a.address().cast::<u8>(), page);
+            slice.fill(0xA5);
+            assert!(slice.iter().all(|&byte| byte == 0xA5));
+        }
+
+        // Dropping the guard simulates a startup failure before `addr_b` is promoted:
+        // `addr_b` must be unmapped, while promoted `addr_a` must stay intact.
+        drop(reservations);
+        assert!(
+            is_unmapped_for_fixed_noreplace(addr_b, page),
+            "unpromoted span must be unmapped when the guard drops"
+        );
+        // SAFETY: `mapping_a` still exclusively owns `addr_a`.
+        unsafe {
+            let slice = std::slice::from_raw_parts(mapping_a.address().cast::<u8>(), page);
+            assert!(slice.iter().all(|&byte| byte == 0xA5));
+        }
+
+        // Dropping `mapping_a` (simulating mlock or cuMemHostRegister failure) unmaps `addr_a`.
+        drop(mapping_a);
+        assert!(
+            is_unmapped_for_fixed_noreplace(addr_a, page),
+            "promoted mapping must be unmapped when OwnedHostMapping drops"
+        );
+    }
+
+    #[test]
+    fn prereserve_rolls_back_earlier_spans_on_collision() {
+        let (addr_a, addr_b, page, blocker) = (0..16)
+            .find_map(|_| {
+                let (base, page) = probe_free_window(4);
+                let addr_a = base + page as u64;
+                let addr_b = base + (2 * page) as u64;
+                // Hold `addr_b` so the second reservation in the batch collides.
+                let blocker = MappedHostReservations::reserve_spans(&[(addr_b, page)]).ok()?;
+                Some((addr_a, addr_b, page, blocker))
+            })
+            .expect("could not set up collision test window");
+
+        let error = MappedHostReservations::reserve_spans(&[(addr_a, page), (addr_b, page)])
+            .err()
+            .expect("colliding span must fail reservation")
+            .to_string();
+        assert!(error.contains("host address collision"), "{error}");
+        assert!(
+            is_unmapped_for_fixed_noreplace(addr_a, page),
+            "earlier span must be unmapped after a later span collides"
+        );
+        drop(blocker);
+        assert!(is_unmapped_for_fixed_noreplace(addr_b, page));
     }
 }

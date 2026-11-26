@@ -7,7 +7,7 @@
 //! A model core owns a disjoint resource bundle for every tensor-parallel rank.
 
 use super::{
-    AuthorizedCore, LoadOptions, NativeResources,
+    AuthorizedCore, LoadOptions, MappedHostReservations, NativeResources,
     format::{Memory, Core, Reservation, invalid},
     payload::Files,
     protection::AuthorizedKind,
@@ -663,6 +663,10 @@ impl NativeModel {
             cluster,
             roce,
         };
+        // Pre-reserve fixed mapped-host VA spans across all local cores before
+        // `cuInit(0)` (in `memory_before_context` or `initialize`) so CUDA's
+        // randomized host VA reservation cannot claim recorded host addresses.
+        let host_reservations = MappedHostReservations::reserve(&cores)?;
         unsafe {
             let before_contexts = if matches!(
                 options.memory_limit,
@@ -770,8 +774,9 @@ impl NativeModel {
             // Reservations cover all ranks and must exist before parallel mapping.
             model.ranks[0].reserve(&cores[0])?;
             model.parallel(&cores, &files, |rank, core, _| {
-                rank.allocate(core, &phase)
+                rank.allocate_with_host_reservations(core, &phase, Some(&host_reservations))
             })?;
+            drop(host_reservations);
             phase.finish(format!(
                 "{:.1} GiB GPU · {:.1} GiB host",
                 gpu_bytes as f64 / (1u64 << 30) as f64,

@@ -25,6 +25,7 @@ pub(super) const TUNE: u8 = 11;
 pub(super) const TUNED: u8 = 12;
 pub(super) const STARTED: u8 = 13;
 const MAX_PACKET: usize = 64 * 1024 * 1024;
+const READ_BUFFER_BYTES: usize = 8192;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(super) fn invalid(message: impl Into<String>) -> Error {
@@ -42,6 +43,8 @@ fn io(error: std::io::Error) -> Error {
 pub(super) struct Channel {
     pub stream: RankStream,
     received: Vec<u8>,
+    read_buffer: Box<[u8]>,
+    is_nonblocking: bool,
 }
 
 impl Channel {
@@ -53,11 +56,23 @@ impl Channel {
         Ok(Self {
             stream,
             received: Vec::new(),
+            read_buffer: vec![0; READ_BUFFER_BYTES].into_boxed_slice(),
+            is_nonblocking: false,
         })
     }
 
-    pub fn nonblocking(&self, enabled: bool) -> Result<()> {
-        self.stream.set_nonblocking(enabled).map_err(io)
+    #[cfg(test)]
+    pub fn is_nonblocking(&self) -> bool {
+        self.is_nonblocking
+    }
+
+    pub fn nonblocking(&mut self, enabled: bool) -> Result<()> {
+        if self.is_nonblocking == enabled {
+            return Ok(());
+        }
+        self.stream.set_nonblocking(enabled).map_err(io)?;
+        self.is_nonblocking = enabled;
+        Ok(())
     }
 
     pub fn idle(&self, enabled: bool) -> Result<()> {
@@ -72,6 +87,7 @@ impl Channel {
                 "tensor-parallel control packet exceeds its size limit",
             ));
         }
+        self.nonblocking(false)?;
         let mut header = [0; 5];
         header[0] = tag;
         header[1..].copy_from_slice(&(data.len() as u32).to_le_bytes());
@@ -100,11 +116,10 @@ impl Channel {
                 }
                 return Ok(Some((bytes[0], bytes[5..].to_vec())));
             }
-            let mut bytes = [0; 8192];
-            let count = bytes.len().min(needed - self.received.len());
-            match self.stream.read(&mut bytes[..count]) {
+            let count = self.read_buffer.len().min(needed - self.received.len());
+            match self.stream.read(&mut self.read_buffer[..count]) {
                 Ok(0) => return Err(invalid("tensor-parallel peer disconnected")),
-                Ok(count) => self.received.extend_from_slice(&bytes[..count]),
+                Ok(count) => self.received.extend_from_slice(&self.read_buffer[..count]),
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
                 Err(error) => return Err(io(error)),
@@ -114,6 +129,7 @@ impl Channel {
 
     /// Wait for the next message, without a deadline when `idle`.
     pub fn wait(&mut self, idle: bool) -> Result<(u8, Vec<u8>)> {
+        self.nonblocking(false)?;
         self.idle(idle)?;
         let message = self.poll();
         self.idle(false)?;

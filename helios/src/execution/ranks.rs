@@ -70,7 +70,7 @@ impl RankExecutor {
         match self {
             Self::Local(executor) => executor.park(),
             Self::Parallel(executor) => executor.park(),
-            Self::Threaded(_) => false,
+            Self::Threaded(executor) => executor.park(),
         }
     }
 

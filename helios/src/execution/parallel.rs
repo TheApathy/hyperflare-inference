@@ -311,34 +311,31 @@ impl TensorParallelExecutor {
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
             peer.channel.nonblocking(true)?;
-            let result = (|| -> Result<()> {
-                while let Some((tag, bytes)) = peer.channel.poll()? {
-                    if tag == READY {
-                        let (fence, graph) = read_identity(&bytes)?;
-                        ready_frame(&mut self.pending, index, fence, graph)?;
-                    } else if tag == COMPLETE {
-                        let mut reader = Reader(&bytes);
-                        let fence = Fence(reader.number()? as u64);
-                        let graph = reader.number()?;
-                        let timing = wire::timing(&mut reader)?;
-                        let proposal_confidence = wire::proposal_confidence(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
-                        let speculative_survival = wire::speculative_survival(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
-                        if reader.0.len() != self.local.manifest().completion_bytes() {
-                            return Err(invalid("rank completion size differs from its ABI"));
-                        }
-                        let completion = FrameCompletion {
-                            logprobs: None, prompt_logprobs: None, proposal_confidence, speculative_survival,
-                            fence, graph_index: graph, timing,
-                            records: super::transport::decode_records(reader.0, fence,
-                                self.local.manifest().request_capacity(), self.local.manifest().completion_fields())?,
-                        };
-                        protocol::record_peer_completion(&mut self.pending, index, completion)?;
-                    } else { return Err(invalid("unexpected rank message")); }
+            while let Some((tag, bytes)) = peer.channel.poll()? {
+                if tag == READY {
+                    let (fence, graph) = read_identity(&bytes)?;
+                    ready_frame(&mut self.pending, index, fence, graph)?;
+                } else if tag == COMPLETE {
+                    let mut reader = Reader(&bytes);
+                    let fence = Fence(reader.number()? as u64);
+                    let graph = reader.number()?;
+                    let timing = wire::timing(&mut reader)?;
+                    let proposal_confidence = wire::proposal_confidence(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
+                    let speculative_survival = wire::speculative_survival(&mut reader, self.local.manifest().request_capacity(), self.local.manifest().completion_token_capacity)?;
+                    if reader.0.len() != self.local.manifest().completion_bytes() {
+                        return Err(invalid("rank completion size differs from its ABI"));
+                    }
+                    let completion = FrameCompletion {
+                        logprobs: None, prompt_logprobs: None, proposal_confidence, speculative_survival,
+                        fence, graph_index: graph, timing,
+                        records: super::transport::decode_records(reader.0, fence,
+                            self.local.manifest().request_capacity(), self.local.manifest().completion_fields())?,
+                    };
+                    protocol::record_peer_completion(&mut self.pending, index, completion)?;
+                } else {
+                    return Err(invalid("unexpected rank message"));
                 }
-                Ok(())
-            })();
-            peer.channel.nonblocking(false)?;
-            result?;
+            }
         }
         for frame in &mut self.pending {
             if frame.committed { continue; }
@@ -355,21 +352,12 @@ impl TensorParallelExecutor {
             }
             frame.committed = true;
         }
-        let Some(mut frame) = protocol::pop_completed_front(&mut self.pending) else {
-            return Ok(None);
-        };
-        let mut root = frame.completions[0].take().unwrap();
-        for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
-            let completion = completion.unwrap();
-            let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::Speculative {
-                agree_speculative
-            } else { agree };
-            agreement(&root, &completion).map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
-            root.timing.merge_rank(index + 1, completion.timing)?;
-        }
-        root.timing.queued = frame.queued;
-        root.timing.wall_ns = frame.dispatched.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        Ok(Some(root))
+        publish_completed_front(
+            &mut self.pending,
+            self.local.manifest(),
+            |frame| frame.queued,
+            |frame| frame.dispatched,
+        )
     }
 
     pub fn close(&mut self) -> Shutdown {
@@ -418,6 +406,50 @@ impl Drop for TensorParallelExecutor {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Validate rank agreement and timing merge on a fully completed front frame
+/// before popping it from `pending`, preserving the failing frame on rejection.
+pub(super) fn publish_completed_front<P: protocol::PendingFrame>(
+    pending: &mut VecDeque<P>,
+    manifest: &ExecutionManifest,
+    queued: impl FnOnce(&P) -> bool,
+    dispatched: impl FnOnce(&P) -> Instant,
+) -> Result<Option<FrameCompletion>> {
+    let Some(front) = pending
+        .front()
+        .filter(|frame| frame.completions().iter().all(Option::is_some))
+    else {
+        return Ok(None);
+    };
+    let root = front.completions()[0]
+        .as_ref()
+        .expect("completed front has rank-zero completion");
+    let agreement = if manifest.graphs[root.graph_index].kind == super::GraphKind::Speculative {
+        agree_speculative
+    } else {
+        agree
+    };
+    let mut merged_timing = root.timing;
+    for (index, completion) in front.completions().iter().skip(1).enumerate() {
+        let completion = completion
+            .as_ref()
+            .expect("completed front has every peer completion");
+        agreement(root, completion)
+            .map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
+        merged_timing.merge_rank(index + 1, completion.timing)?;
+    }
+    let mut frame = protocol::pop_completed_front(pending)
+        .expect("validated completed front remains at the queue head");
+    let frame_queued = queued(&frame);
+    let wall_ns = dispatched(&frame).elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let mut root = frame.completions_mut()[0]
+        .take()
+        .expect("validated completed front has rank-zero completion");
+    merged_timing.queued = frame_queued;
+    merged_timing.wall_ns = wall_ns;
+    root.timing = merged_timing;
+    Ok(Some(root))
 }
 
 pub(super) fn agree(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()> {
@@ -585,9 +617,12 @@ pub unsafe fn serve_rank(
             let mut started = VecDeque::new();
             loop {
                 let active = executor.outstanding() != 0 || prepared.is_some();
-                channel.nonblocking(active)?;
-                let message = if active { channel.poll()? } else { Some(channel.wait(true)?) };
-                channel.nonblocking(false)?;
+                let message = if active {
+                    channel.nonblocking(true)?;
+                    channel.poll()?
+                } else {
+                    Some(channel.wait(true)?)
+                };
                 if let Some((tag, bytes)) = message {
                     match tag {
                         DRAIN if bytes.is_empty() => {

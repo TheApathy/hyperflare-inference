@@ -306,6 +306,11 @@ impl ThreadedExecutor {
     pub fn outstanding(&self) -> usize {
         self.pending.len()
     }
+    /// Park on rank zero's own running frame; peer completions arrive over their channels
+    /// and are polled by the caller as before. See [`GraphExecutor::park`].
+    pub fn park(&self) -> bool {
+        self.local.park()
+    }
     pub fn can_submit(&self, grammar: bool) -> bool {
         self.poison.is_none()
             && self.shutdown.is_none()
@@ -409,19 +414,12 @@ impl ThreadedExecutor {
             }
             frame.committed = true;
         }
-        let Some(mut frame) = protocol::pop_completed_front(&mut self.pending) else { return Ok(None); };
-        let mut root = frame.completions[0].take().unwrap();
-        for (index, completion) in frame.completions.into_iter().skip(1).enumerate() {
-            let completion = completion.unwrap();
-            let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::Speculative {
-                super::parallel::agree_speculative
-            } else { super::parallel::agree };
-            agreement(&root, &completion).map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
-            root.timing.merge_rank(index + 1, completion.timing)?;
-        }
-        root.timing.queued = frame.queued;
-        root.timing.wall_ns = frame.dispatched.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        Ok(Some(root))
+        super::parallel::publish_completed_front(
+            &mut self.pending,
+            self.local.manifest(),
+            |frame| frame.queued,
+            |frame| frame.dispatched,
+        )
     }
     pub fn close(&mut self) -> Shutdown {
         if let Some(shutdown) = &self.shutdown {
@@ -574,7 +572,14 @@ fn rank_loop(
         if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
             return Err(invalid("rank graph completion deadline expired"));
         }
-        if executor.outstanding() != 0 || prepared.is_some() { thread::yield_now(); }
+        // A peer waiting only on its own running frame parks on it; a prepared frame waits
+        // for rank zero's commit over the channel, which cannot end a park.
+        if executor.outstanding() != 0 || prepared.is_some() {
+            if prepared.is_none() {
+                executor.park();
+            }
+            thread::yield_now();
+        }
     }
 }
 
@@ -889,6 +894,119 @@ mod tests {
                 assert!(!same_layout(&ranks[0], &bad));
             }
         }
+    }
+
+    #[test]
+    fn publish_completed_front_preserves_threaded_pending_frame_on_rejection() {
+        use super::super::{CompletionRecord, ExecutionTiming, GraphKind, ReadinessIntervals};
+
+        let mut manifest = super::super::tests::manifest();
+        manifest.graphs[0].kind = GraphKind::Decode;
+        let make_completion = |gpu_ns: u64, consumed: i64, readiness: Option<ReadinessIntervals>| {
+            FrameCompletion {
+                fence: Fence(1),
+                graph_index: 0,
+                timing: ExecutionTiming {
+                    gpu_ns: [
+                        Some(gpu_ns),
+                        None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None,
+                    ],
+                    readiness,
+                    wall_ns: 0,
+                    queued: false,
+                },
+                records: vec![CompletionRecord {
+                    generation: 1,
+                    submission_sequence: 1,
+                    consumed_tokens: consumed,
+                    status: 1,
+                    ..Default::default()
+                }]
+                .into(),
+                logprobs: None,
+                prompt_logprobs: None,
+                proposal_confidence: None,
+                speculative_survival: None,
+            }
+        };
+        let make_frame = |completions: Vec<Option<FrameCompletion>>| Pending {
+            step: Arc::new(Step {
+                fence: Fence(1),
+                graph: 0,
+                grammar: false,
+                uploads: Vec::new(),
+            }),
+            dispatched: Instant::now(),
+            committed: true,
+            queued: true,
+            ready: vec![true, true],
+            completions,
+        };
+
+        // Rank 1 agrees and merges cleanly, then rank 2 fails agreement:
+        // the front frame remains queued and rank 0's stored timing is untouched.
+        let mut pending = VecDeque::from([make_frame(vec![
+            Some(make_completion(100, 16, None)),
+            Some(make_completion(150, 16, None)),
+            Some(make_completion(200, 15, None)),
+        ])]);
+        let error = super::super::parallel::publish_completed_front(
+            &mut pending,
+            &manifest,
+            |frame| frame.queued,
+            |frame| frame.dispatched,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("rank 2:"), "{error}");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].completions[0].as_ref().unwrap().timing.gpu_ns[1], None);
+        assert_eq!(pending[0].completions[0].as_ref().unwrap().timing.gpu_ns[2], None);
+
+        // Rank 1 agrees and merges cleanly, then rank 2 fails readiness timing merge:
+        // the front frame remains queued and rank 0's stored timing is untouched.
+        let readiness = Some(
+            ReadinessIntervals::decode(
+                &[10u64, 20, 25]
+                    .into_iter()
+                    .flat_map(u64::to_ne_bytes)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        pending[0].completions = vec![
+            Some(make_completion(100, 16, readiness)),
+            Some(make_completion(150, 16, readiness)),
+            Some(make_completion(200, 16, None)),
+        ];
+        let error = super::super::parallel::publish_completed_front(
+            &mut pending,
+            &manifest,
+            |frame| frame.queued,
+            |frame| frame.dispatched,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("readiness timestamp bindings differ"), "{error}");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].completions[0].as_ref().unwrap().timing.gpu_ns[1], None);
+
+        // Matching completions across all three ranks validate, pop, and merge timings.
+        pending[0].completions[2] = Some(make_completion(200, 16, readiness));
+        let published = super::super::parallel::publish_completed_front(
+            &mut pending,
+            &manifest,
+            |frame| frame.queued,
+            |frame| frame.dispatched,
+        )
+        .unwrap()
+        .expect("validated threaded front frame should publish");
+        assert!(pending.is_empty());
+        assert_eq!(published.timing.gpu_ns[0], Some(100));
+        assert_eq!(published.timing.gpu_ns[1], Some(150));
+        assert_eq!(published.timing.gpu_ns[2], Some(200));
+        assert!(published.timing.queued);
     }
 }
 

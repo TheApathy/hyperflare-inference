@@ -705,3 +705,168 @@ fn socket_parallel_execution_rejects_persistent_workers() {
         "unexpected error: {peer_err}"
     );
 }
+
+#[cfg(unix)]
+fn assert_nonblocking(channel: &Channel) {
+    use std::os::fd::AsRawFd;
+    let fd = match &channel.stream {
+        RankStream::Unix(stream) => stream.as_raw_fd(),
+        RankStream::Tcp(stream) => stream.as_raw_fd(),
+    };
+    // SAFETY: F_GETFL reads flags from the live socket without retaining its descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_ne!(flags & libc::O_NONBLOCK, 0);
+}
+
+#[test]
+fn channel_caches_nonblocking_mode_and_restores_blocking_for_send_and_wait() {
+    let (left, right) = crate::execution::rank_stream::test_pair().unwrap();
+    let mut left = Channel::new(left).unwrap();
+    let mut right = Channel::new(right).unwrap();
+    assert!(!left.is_nonblocking());
+    assert!(!right.is_nonblocking());
+    #[cfg(unix)]
+    {
+        assert_blocking(&left);
+        assert_blocking(&right);
+    }
+
+    right.nonblocking(true).unwrap();
+    assert!(right.is_nonblocking());
+    #[cfg(unix)]
+    assert_nonblocking(&right);
+    // Repeated polls in nonblocking mode leave the socket nonblocking and return None.
+    right.nonblocking(true).unwrap();
+    assert!(right.poll().unwrap().is_none());
+    assert!(right.poll().unwrap().is_none());
+    assert!(right.is_nonblocking());
+    #[cfg(unix)]
+    assert_nonblocking(&right);
+
+    // Sending on a nonblocking channel restores blocking mode automatically.
+    left.nonblocking(true).unwrap();
+    assert!(left.is_nonblocking());
+    left.send(READY, &[1, 2, 3, 4]).unwrap();
+    assert!(!left.is_nonblocking());
+    #[cfg(unix)]
+    assert_blocking(&left);
+
+    // Waiting on a nonblocking channel restores blocking mode and receives the packet.
+    assert_eq!(right.wait(false).unwrap(), (READY, vec![1, 2, 3, 4]));
+    assert!(!right.is_nonblocking());
+    #[cfg(unix)]
+    assert_blocking(&right);
+}
+
+#[test]
+fn publish_completed_front_preserves_pending_frame_on_agreement_or_timing_rejection() {
+    let mut manifest = crate::execution::tests::manifest();
+    manifest.graphs[0].kind = crate::execution::GraphKind::Decode;
+
+    let make_completion = |fence: u64, status: i64, gpu_ns: u64| {
+        let mut value = completed(status);
+        value.fence = Fence(fence);
+        value.graph_index = 0;
+        value.timing.gpu_ns[0] = Some(gpu_ns);
+        value
+    };
+    let make_pending = |fence: u64, queued: bool, root: FrameCompletion, peer: FrameCompletion| {
+        Pending {
+            fence: Fence(fence),
+            graph: 0,
+            grammar: false,
+            uploads: Vec::new(),
+            dispatched: Instant::now(),
+            committed: true,
+            queued,
+            ready: vec![true],
+            completions: vec![Some(root), Some(peer)],
+        }
+    };
+
+    // Agreement rejection preserves the failing front frame and its stored completions.
+    let root = make_completion(1, 2, 100);
+    let mut bad_peer = make_completion(1, 1, 200);
+    bad_peer.records[0].consumed_tokens -= 1;
+    let mut pending = VecDeque::from([
+        make_pending(1, false, root, bad_peer),
+        Pending {
+            fence: Fence(2),
+            graph: 0,
+            grammar: false,
+            uploads: Vec::new(),
+            dispatched: Instant::now(),
+            committed: false,
+            queued: true,
+            ready: vec![false],
+            completions: vec![None, None],
+        },
+    ]);
+    let error = publish_completed_front(&mut pending, &manifest, |f| f.queued, |f| f.dispatched)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("rank 1:"), "{error}");
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].fence, Fence(1));
+    assert!(pending[0].completions[0].is_some());
+    assert!(pending[0].completions[1].is_some());
+    assert_eq!(pending[0].completions[0].as_ref().unwrap().timing.gpu_ns[1], None);
+
+    // Speculative agreement rejection preserves the failing front frame as well.
+    let mut spec_manifest = manifest.clone();
+    spec_manifest.graphs[0].kind = crate::execution::GraphKind::Speculative;
+    let mut spec_root = make_completion(1, 1, 100);
+    spec_root.records[0].token_id = 42;
+    let mut spec_peer = make_completion(1, 1, 200);
+    spec_peer.records[0].token_id = 43;
+    pending[0].completions = vec![Some(spec_root), Some(spec_peer)];
+    let error = publish_completed_front(
+        &mut pending,
+        &spec_manifest,
+        |f| f.queued,
+        |f| f.dispatched,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("rank 1:"), "{error}");
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].fence, Fence(1));
+    assert!(pending[0].completions[0].is_some());
+    assert!(pending[0].completions[1].is_some());
+
+    // Timing merge rejection preserves the failing front frame without partial mutation.
+    let mut timed_root = make_completion(1, 1, 100);
+    timed_root.timing.readiness = Some(
+        super::super::ReadinessIntervals::decode(
+            &[100u64, 110, 111]
+                .into_iter()
+                .flat_map(u64::to_ne_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    let timed_peer = make_completion(1, 1, 250);
+    pending[0].completions = vec![Some(timed_root), Some(timed_peer)];
+    let error = publish_completed_front(&mut pending, &manifest, |f| f.queued, |f| f.dispatched)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("readiness timestamp bindings differ"), "{error}");
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].fence, Fence(1));
+    assert_eq!(pending[0].completions[0].as_ref().unwrap().timing.gpu_ns[1], None);
+
+    // Valid agreement and timing merge pops only the front frame and merges peer timing.
+    let good_root = make_completion(1, 2, 100);
+    let good_peer = make_completion(1, 1, 250);
+    pending[0].completions = vec![Some(good_root), Some(good_peer)];
+    let published = publish_completed_front(&mut pending, &manifest, |f| f.queued, |f| f.dispatched)
+        .unwrap()
+        .expect("validated front frame should publish");
+    assert_eq!(published.fence, Fence(1));
+    assert_eq!(published.timing.gpu_ns[0], Some(100));
+    assert_eq!(published.timing.gpu_ns[1], Some(250));
+    assert!(!published.timing.queued);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].fence, Fence(2));
+}
