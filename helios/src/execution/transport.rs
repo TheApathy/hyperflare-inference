@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use std::{marker::PhantomData, rc::Rc, time::Instant};
+use std::{collections::HashMap, marker::PhantomData, rc::Rc, time::Instant};
 
 use crate::{
     Error, ExecutionError, Failure, Result, Shutdown,
@@ -195,10 +195,67 @@ impl CompletionRecord {
         values
     }
 }
+fn infer_token_capacity(records: &[CompletionRecord]) -> usize {
+    records
+        .iter()
+        .find_map(|record| record.vector.as_ref().map(|vector| vector.tokens.len()))
+        .unwrap_or(DEFAULT_COMPLETION_TOKEN_CAPACITY)
+}
+
 /// Completion storage sized to the prepared request and token capacities.
 #[derive(Debug, Clone)]
 pub struct CompletionRecords {
     records: Vec<CompletionRecord>,
+    token_capacity: usize,
+}
+
+impl CompletionRecords {
+    pub(crate) fn token_capacity(&self) -> usize {
+        self.token_capacity
+    }
+
+    pub(crate) fn write_wire_bytes(&self, out: &mut Vec<u8>) {
+        for record in &self.records {
+            for field in [
+                record.generation,
+                record.submission_sequence,
+                record.consumed_tokens,
+                record.generated_tokens,
+                record.token_id,
+                record.status,
+                record.error_code,
+                record.reserved,
+            ] {
+                out.extend_from_slice(&field.to_le_bytes());
+            }
+            if let Some(v) = &record.vector {
+                for field in [
+                    v.emitted_count,
+                    v.offered_drafts,
+                    v.accepted_drafts,
+                    v.copy_offered_mask,
+                    v.model_reserved,
+                    v.draft_cache_consumed,
+                    0,
+                    v.verification_width,
+                ] {
+                    out.extend_from_slice(&field.to_le_bytes());
+                }
+                for &token in &v.tokens {
+                    out.extend_from_slice(&token.to_le_bytes());
+                }
+            } else if record.status == 0 {
+                // Inactive vector payload is undefined by the transport ABI; zero-fill
+                // the remaining metadata and token words to preserve frame byte extent.
+                out.resize(
+                    out.len() + (COMPLETION_METADATA_FIELDS - 8 + self.token_capacity) * 8,
+                    0,
+                );
+            } else {
+                let _ = record.fields();
+            }
+        }
+    }
 }
 
 impl std::ops::Deref for CompletionRecords {
@@ -215,14 +272,17 @@ impl std::ops::DerefMut for CompletionRecords {
 impl<const N: usize> From<[CompletionRecord; N]> for CompletionRecords {
     fn from(values: [CompletionRecord; N]) -> Self {
         assert!(N <= REQUEST_LANES);
-        Self { records: Vec::from(values) }
+        let records = Vec::from(values);
+        let token_capacity = infer_token_capacity(&records);
+        Self { records, token_capacity }
     }
 }
 
 impl From<Vec<CompletionRecord>> for CompletionRecords {
     fn from(records: Vec<CompletionRecord>) -> Self {
         assert!(records.len() <= REQUEST_LANES);
-        Self { records }
+        let token_capacity = infer_token_capacity(&records);
+        Self { records, token_capacity }
     }
 }
 
@@ -451,12 +511,143 @@ struct Resources {
     wake: Option<CompletionWake>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IndexedBinding {
+    host_offset: usize,
+    device_address: usize,
+    nbytes: usize,
+    dtype_size: usize,
+}
+
+struct GraphBindingIndex {
+    frame_index: ResolvedUpload,
+    submission_sequence: ResolvedUpload,
+    bindings: HashMap<String, IndexedBinding>,
+}
+
+/// Pre-indexed manifest lookup tables built once from a validated, immutable manifest.
+pub(super) struct ManifestIndex {
+    graphs: Vec<GraphBindingIndex>,
+    completion_records_address: usize,
+    completion_logprobs: Option<(usize, usize, usize)>,
+    max_top_logprobs: usize,
+    logprob_token_id_capacity: usize,
+    prompt_logprobs: Option<(usize, usize)>,
+    proposal_confidence: Option<(usize, usize, usize)>,
+    speculative_survival: Option<(usize, usize)>,
+    readiness_timestamps: Option<(usize, usize)>,
+}
+
+impl ManifestIndex {
+    pub(super) fn build(manifest: &ExecutionManifest) -> Result<Self> {
+        let buffers: HashMap<&str, &super::BufferDescriptor> = manifest
+            .buffers
+            .iter()
+            .map(|buffer| (buffer.name.as_str(), buffer))
+            .collect();
+        let buffer = |name: &str| -> Result<&super::BufferDescriptor> {
+            buffers.get(name).copied().ok_or_else(|| {
+                Error::execution(ExecutionError::Manifest, format!("unknown buffer {name:?}"))
+            })
+        };
+        let mut graphs = Vec::with_capacity(manifest.graphs.len());
+        for graph in &manifest.graphs {
+            let mut bindings = HashMap::with_capacity(graph.input_bindings.len());
+            let mut frame_index = None;
+            let mut submission_sequence = None;
+            for binding in &graph.input_bindings {
+                let descriptor = buffer(&binding.buffer_name)?;
+                match binding.buffer_name.as_str() {
+                    "frame_index" => {
+                        frame_index = Some(ResolvedUpload {
+                            host_offset: binding.host_offset,
+                            device_address: descriptor.address,
+                            nbytes: descriptor.nbytes,
+                        });
+                    }
+                    "submission_sequence" => {
+                        submission_sequence = Some(ResolvedUpload {
+                            host_offset: binding.host_offset,
+                            device_address: descriptor.address,
+                            nbytes: descriptor.nbytes,
+                        });
+                    }
+                    _ => {
+                        bindings.insert(
+                            binding.buffer_name.clone(),
+                            IndexedBinding {
+                                host_offset: binding.host_offset,
+                                device_address: descriptor.address,
+                                nbytes: binding.nbytes,
+                                dtype_size: descriptor.dtype.size(),
+                            },
+                        );
+                    }
+                }
+            }
+            let frame_index = frame_index.ok_or_else(|| {
+                Error::execution(
+                    ExecutionError::Upload,
+                    "graph lacks a reserved input binding",
+                )
+            })?;
+            let submission_sequence = submission_sequence.ok_or_else(|| {
+                Error::execution(
+                    ExecutionError::Upload,
+                    "graph lacks a reserved input binding",
+                )
+            })?;
+            graphs.push(GraphBindingIndex {
+                frame_index,
+                submission_sequence,
+                bindings,
+            });
+        }
+        let max_top_logprobs = manifest.max_top_logprobs()?;
+        let logprob_token_id_capacity = buffers
+            .get("logprob_token_ids")
+            .map_or(0, |b| b.shape[1]);
+        let completion_records_address = buffer("completion_records")?.address;
+        let completion_logprobs = buffers
+            .get("completion_logprobs")
+            .map(|b| (b.address, b.nbytes, b.shape[3]));
+        let prompt_logprobs = if manifest.prompt_logprob_capacity()? != 0 {
+            let b = buffer("prompt_logprobs")?;
+            Some((b.address, b.nbytes))
+        } else {
+            None
+        };
+        let proposal_confidence = buffers
+            .get("proposal_confidence")
+            .map(|b| (b.address, b.nbytes, b.shape[2]));
+        let speculative_survival = buffers
+            .get("completion_speculative_survival")
+            .map(|b| (b.address, b.nbytes));
+        let readiness_timestamps = buffers
+            .get("readiness_timestamps")
+            .map(|b| (b.address, b.nbytes));
+        Ok(Self {
+            graphs,
+            completion_records_address,
+            completion_logprobs,
+            max_top_logprobs,
+            logprob_token_id_capacity,
+            prompt_logprobs,
+            proposal_confidence,
+            speculative_survival,
+            readiness_timestamps,
+        })
+    }
+}
+
 /// Thread-bound executor over one borrowed prepared model and its CUDA context.
 pub struct GraphExecutor {
     manifest: ExecutionManifest,
+    index: ManifestIndex,
     pub(super) copy_logprobs: bool,
     resources: Option<Resources>,
     resolved_uploads: Vec<ResolvedUpload>,
+    overlap_scratch: Vec<(usize, usize)>,
     startup_next: usize,
     startup_ready: bool,
     next_sequence: u64,
@@ -484,6 +675,7 @@ impl GraphExecutor {
     /// Construct rank-local streams without launching any collective graphs.
     pub(super) unsafe fn new_unstarted(manifest: ExecutionManifest) -> Result<Self> {
         manifest.validate()?;
+        let index = ManifestIndex::build(&manifest)?;
         let upload_capacity = manifest
             .graphs
             .iter()
@@ -493,43 +685,53 @@ impl GraphExecutor {
             .saturating_mul(manifest.request_capacity());
         let model = Stream::open(manifest.context, manifest.device)?;
         let copy = Stream::open(manifest.context, manifest.device)?;
+        let needs_confidence = manifest
+            .graphs
+            .iter()
+            .any(|graph| graph.confidence_width > 0);
         let mut frame_index = 0;
         let mut frame = || -> Result<Frame> {
-            let index = frame_index;
+            let slot = frame_index;
             frame_index += 1;
             Ok(Frame {
                 input: model.host_buffer(manifest.input_frame_bytes)?,
                 output: model.host_buffer(manifest.completion_bytes())?,
-                logprobs: if manifest.max_top_logprobs()? != 0 {
-                    let b = manifest.buffer("completion_logprobs")?;
+                logprobs: if index.max_top_logprobs != 0 {
+                    let (address, nbytes, _) = index.completion_logprobs.unwrap();
                     Some(Readback::new(
-                        &model, b.address + index * b.nbytes / 2, b.nbytes / 2,
+                        &model, address + slot * nbytes / 2, nbytes / 2,
                     )?)
                 } else {
                     None
                 },
-                prompt_logprobs: if manifest.prompt_logprob_capacity()? != 0 {
-                    let b = manifest.buffer("prompt_logprobs")?;
-                    Some(Readback::new(
-                        &model, b.address + index * b.nbytes / 2, b.nbytes / 2,
-                    )?)
-                } else {
-                    None
-                },
-                confidence: manifest
-                    .graphs
-                    .iter()
-                    .any(|graph| graph.confidence_width > 0)
-                    .then(|| {
-                        let buffer = manifest.buffer("proposal_confidence")?;
-                        Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2)
+                prompt_logprobs: index
+                    .prompt_logprobs
+                    .map(|(address, nbytes)| {
+                        Readback::new(&model, address + slot * nbytes / 2, nbytes / 2)
                     })
                     .transpose()?,
-                survival: manifest.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival")
-                    .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
+                confidence: needs_confidence
+                    .then(|| {
+                        let (address, nbytes, _) = index.proposal_confidence.ok_or_else(|| {
+                            Error::execution(
+                                ExecutionError::Manifest,
+                                "unknown buffer \"proposal_confidence\"",
+                            )
+                        })?;
+                        Readback::new(&model, address + slot * nbytes / 2, nbytes / 2)
+                    })
                     .transpose()?,
-                readiness: manifest.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps")
-                    .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
+                survival: index
+                    .speculative_survival
+                    .map(|(address, nbytes)| {
+                        Readback::new(&model, address + slot * nbytes / 2, nbytes / 2)
+                    })
+                    .transpose()?,
+                readiness: index
+                    .readiness_timestamps
+                    .map(|(address, nbytes)| {
+                        Readback::new(&model, address + slot * nbytes / 2, nbytes / 2)
+                    })
                     .transpose()?,
                 produced: model.event_with_timing(true)?,
                 started: model.event_with_timing(true)?,
@@ -557,6 +759,7 @@ impl GraphExecutor {
             .transpose()?;
         Ok(Self {
             manifest,
+            index,
             copy_logprobs: true,
             resources: Some(Resources {
                 model,
@@ -567,6 +770,7 @@ impl GraphExecutor {
                 wake,
             }),
             resolved_uploads: Vec::with_capacity(upload_capacity),
+            overlap_scratch: Vec::with_capacity(upload_capacity),
             startup_next: 0,
             startup_ready: false,
             next_sequence: 1,
@@ -751,7 +955,14 @@ impl GraphExecutor {
         grammar: bool,
     ) -> Result<Option<Fence>> {
         let fence = self.next_fence()?;
-        validate_uploads(&self.manifest, graph, uploads, &mut self.resolved_uploads)?;
+        validate_uploads_indexed(
+            &self.manifest,
+            &self.index,
+            graph,
+            uploads,
+            &mut self.resolved_uploads,
+            &mut self.overlap_scratch,
+        )?;
         if !self.can_submit(grammar || !matches!(self.manifest.graphs[graph].kind,
             GraphKind::Decode | GraphKind::Speculative)) {
             return Ok(None);
@@ -807,11 +1018,13 @@ impl GraphExecutor {
             })?;
         let grammar_constrained = grammar_constrained
             || !matches!(graph.kind, GraphKind::Decode | GraphKind::Speculative);
-        let mut resolved = validate_uploads(
+        let mut resolved = validate_uploads_indexed(
             &self.manifest,
+            &self.index,
             graph_index,
             uploads,
             &mut self.resolved_uploads,
+            &mut self.overlap_scratch,
         )?;
         if (resources.frames.iter().any(|frame| frame.pending.is_some()) && grammar_constrained)
             || resources
@@ -888,7 +1101,7 @@ impl GraphExecutor {
             resources.model.launch(graph.handle)?;
             resources.model.record(&frame.produced)?;
             resources.copy.wait(&frame.produced)?;
-            let address = self.manifest.buffer("completion_records")?.address
+            let address = self.index.completion_records_address
                 + index * self.manifest.completion_bytes();
             // SAFETY: The manifest bounds both completion rows; index selects one
             // row in that retained allocation. The copy stream waits for the model
@@ -901,37 +1114,43 @@ impl GraphExecutor {
                     self.manifest.completion_bytes(),
                 )?;
                 if logprobs != 0 {
-                    let b = self.manifest.buffer("completion_logprobs")?;
+                    let (b_address, b_nbytes, b_fields) = self.index.completion_logprobs.unwrap();
                     frame.logprobs.as_ref().unwrap().enqueue_pitched_copy(
-                        &resources.copy, b.address + index * b.nbytes / 2,
-                        b.shape[3] * 4, (2 + 2 * logprob_width) * 4,
+                        &resources.copy, b_address + index * b_nbytes / 2,
+                        b_fields * 4, (2 + 2 * logprob_width) * 4,
                         self.manifest.request_capacity() * self.manifest.completion_token_capacity,
                     )?;
                 }
                 if prompt_rows != 0 {
-                    let b = self.manifest.buffer("prompt_logprobs")?;
+                    let (b_address, b_nbytes) = self.index.prompt_logprobs.unwrap();
                     frame.prompt_logprobs.as_ref().unwrap().enqueue_copy(&resources.copy,
-                        b.address + index * b.nbytes / 2, prompt_rows * super::PROMPT_FIELDS * 4)?;
+                        b_address + index * b_nbytes / 2, prompt_rows * super::PROMPT_FIELDS * 4)?;
                 }
                 if graph.confidence_width > 0 {
-                    let confidence = self.manifest.buffer("proposal_confidence")?;
+                    let (c_address, c_nbytes, _) = self.index.proposal_confidence.unwrap();
                     frame.confidence.as_ref().unwrap().enqueue_copy(
-                        &resources.copy, confidence.address + index * confidence.nbytes / 2, confidence.nbytes / 2,
+                        &resources.copy, c_address + index * c_nbytes / 2, c_nbytes / 2,
                     )?;
                 }
-                if reads_speculative_survival(graph) {
-                    if let Some(readback) = &frame.survival {
-                        let buffer = self.manifest.buffer("completion_speculative_survival")?;
-                        readback.enqueue_copy(&resources.copy, buffer.address + index * buffer.nbytes / 2,
-                                              buffer.nbytes / 2)?;
-                    }
+                if reads_speculative_survival(graph)
+                    && let Some(readback) = &frame.survival
+                {
+                    let (s_address, s_nbytes) = self.index.speculative_survival.unwrap();
+                    readback.enqueue_copy(
+                        &resources.copy,
+                        s_address + index * s_nbytes / 2,
+                        s_nbytes / 2,
+                    )?;
                 }
-                if crate::engram::consumes(graph.kind) {
-                    if let Some(readback) = &frame.readiness {
-                        let buffer = self.manifest.buffer("readiness_timestamps")?;
-                        readback.enqueue_copy(&resources.copy, buffer.address + index * buffer.nbytes / 2,
-                                              buffer.nbytes / 2)?;
-                    }
+                if crate::engram::consumes(graph.kind)
+                    && let Some(readback) = &frame.readiness
+                {
+                    let (r_address, r_nbytes) = self.index.readiness_timestamps.unwrap();
+                    readback.enqueue_copy(
+                        &resources.copy,
+                        r_address + index * r_nbytes / 2,
+                        r_nbytes / 2,
+                    )?;
                 }
             }
             resources.copy.record(&frame.transferred)?;
@@ -1009,15 +1228,16 @@ impl GraphExecutor {
             // and pinned destination remain owned until decoding completes.
             let readback = frame.logprobs.as_ref().unwrap();
             let fields = match readback {
-                Readback::MappedHost { .. } => self.manifest.buffer("completion_logprobs")?.shape[3],
+                Readback::MappedHost { .. } => self.index.completion_logprobs.unwrap().2,
                 Readback::DeviceCopy(_) => 2 + 2 * pending.logprob_width,
             };
             let bytes = unsafe { readback.bytes() };
             let nbytes = records.len() * self.manifest.completion_token_capacity * fields * size_of::<f32>();
-            match decode_logprobs(
+            match decode_logprobs_with_capacity(
                 &bytes[..nbytes],
                 &records,
-                self.manifest.max_top_logprobs()?,
+                self.manifest.completion_token_capacity,
+                self.index.max_top_logprobs,
                 fields,
                 pending.logprobs,
                 &pending.logprob_token_ids,
@@ -1117,13 +1337,14 @@ impl GraphExecutor {
             {
                 let mut confidence = vec![vec![0.0; self.manifest.completion_token_capacity - 1]; self.manifest.request_capacity()];
                 let graph = &self.manifest.graphs[pending.graph_index];
+                let confidence_stride = 4 * self.index.proposal_confidence.unwrap().2;
                 for (row, bytes) in confidence
                     .iter_mut()
                     .take(graph.batch_capacity)
                     // SAFETY: The transfer event follows the producing graph;
                     // this frame remains reserved while its sidecar is decoded.
                     .zip(unsafe { frame.confidence.as_ref().unwrap().bytes() }
-                        .chunks_exact(4 * self.manifest.buffer("proposal_confidence")?.shape[2]))
+                        .chunks_exact(confidence_stride))
                 {
                     for (value, bytes) in row.iter_mut().take(graph.confidence_width).zip(bytes.chunks_exact(4)) {
                         *value = f32::from_ne_bytes(bytes.try_into().unwrap());
@@ -1227,13 +1448,38 @@ impl ResolvedUploads<'_, '_, '_> {
 /// Storage grows only to the fragment-count high-water; valid nonempty disjoint
 /// fragments are bounded by input_frame_bytes. The executor reserves four uploads
 /// per binding for physical request lanes before accepting any submissions.
+#[cfg(test)]
 pub(super) fn validate_uploads<'uploads, 'bytes, 'storage>(
     manifest: &ExecutionManifest,
     graph_index: usize,
     uploads: &'uploads [Upload<'bytes>],
     storage: &'storage mut Vec<ResolvedUpload>,
 ) -> Result<ResolvedUploads<'uploads, 'bytes, 'storage>> {
+    let mut overlap_scratch = Vec::with_capacity(uploads.len());
+    validate_uploads_inner(manifest, None, graph_index, uploads, storage, &mut overlap_scratch)
+}
+
+pub(super) fn validate_uploads_indexed<'uploads, 'bytes, 'storage>(
+    manifest: &ExecutionManifest,
+    index: &ManifestIndex,
+    graph_index: usize,
+    uploads: &'uploads [Upload<'bytes>],
+    storage: &'storage mut Vec<ResolvedUpload>,
+    overlap_scratch: &mut Vec<(usize, usize)>,
+) -> Result<ResolvedUploads<'uploads, 'bytes, 'storage>> {
+    validate_uploads_inner(manifest, Some(index), graph_index, uploads, storage, overlap_scratch)
+}
+
+fn validate_uploads_inner<'uploads, 'bytes, 'storage>(
+    manifest: &ExecutionManifest,
+    index: Option<&ManifestIndex>,
+    graph_index: usize,
+    uploads: &'uploads [Upload<'bytes>],
+    storage: &'storage mut Vec<ResolvedUpload>,
+    overlap_scratch: &mut Vec<(usize, usize)>,
+) -> Result<ResolvedUploads<'uploads, 'bytes, 'storage>> {
     storage.clear();
+    overlap_scratch.clear();
     let graph = manifest
         .graphs
         .get(graph_index)
@@ -1251,70 +1497,96 @@ pub(super) fn validate_uploads<'uploads, 'bytes, 'storage>(
             "upload count exceeds the nonempty input-fragment bound",
         ));
     }
-    let reserved = |name: &str| -> Result<ResolvedUpload> {
-        let binding = graph
-            .input_bindings
-            .iter()
-            .find(|binding| binding.buffer_name == name)
-            .ok_or_else(|| {
-                Error::execution(
-                    ExecutionError::Upload,
-                    "graph lacks a reserved input binding",
-                )
-            })?;
-        let buffer = manifest.buffer(name)?;
-        Ok(ResolvedUpload {
-            host_offset: binding.host_offset,
-            device_address: buffer.address,
-            nbytes: buffer.nbytes,
-        })
+    let graph_index_entry = index.map(|idx| &idx.graphs[graph_index]);
+    let (frame_index, submission_sequence) = if let Some(entry) = graph_index_entry {
+        (entry.frame_index, entry.submission_sequence)
+    } else {
+        let reserved = |name: &str| -> Result<ResolvedUpload> {
+            let binding = graph
+                .input_bindings
+                .iter()
+                .find(|binding| binding.buffer_name == name)
+                .ok_or_else(|| {
+                    Error::execution(
+                        ExecutionError::Upload,
+                        "graph lacks a reserved input binding",
+                    )
+                })?;
+            let buffer = manifest.buffer(name)?;
+            Ok(ResolvedUpload {
+                host_offset: binding.host_offset,
+                device_address: buffer.address,
+                nbytes: buffer.nbytes,
+            })
+        };
+        (reserved("frame_index")?, reserved("submission_sequence")?)
     };
-    let frame_index = reserved("frame_index")?;
-    let submission_sequence = reserved("submission_sequence")?;
+    let mut sorted = true;
+    let mut prev_end = 0usize;
     for upload in uploads {
-        if ["frame_index", "submission_sequence"].contains(&upload.buffer) {
+        if upload.buffer == "frame_index" || upload.buffer == "submission_sequence" {
             return Err(Error::execution(
                 ExecutionError::Upload,
                 "reserved executor inputs cannot be overridden",
             ));
         }
-        let binding = graph
-            .input_bindings
-            .iter()
-            .find(|binding| binding.buffer_name == upload.buffer)
-            .ok_or_else(|| {
+        let binding = if let Some(entry) = graph_index_entry {
+            *entry.bindings.get(upload.buffer).ok_or_else(|| {
                 Error::execution(ExecutionError::Upload, "upload is not bound by this graph")
-            })?;
-        let buffer = manifest.buffer(upload.buffer)?;
+            })?
+        } else {
+            let binding = graph
+                .input_bindings
+                .iter()
+                .find(|binding| binding.buffer_name == upload.buffer)
+                .ok_or_else(|| {
+                    Error::execution(ExecutionError::Upload, "upload is not bound by this graph")
+                })?;
+            let buffer = manifest.buffer(upload.buffer)?;
+            IndexedBinding {
+                host_offset: binding.host_offset,
+                device_address: buffer.address,
+                nbytes: binding.nbytes,
+                dtype_size: buffer.dtype.size(),
+            }
+        };
+        let end = upload.offset.checked_add(upload.bytes.len());
         if upload.bytes.is_empty()
-            || upload.offset % buffer.dtype.size() != 0
-            || upload.bytes.len() % buffer.dtype.size() != 0
-            || upload
-                .offset
-                .checked_add(upload.bytes.len())
-                .is_none_or(|end| end > binding.nbytes)
+            || upload.offset % binding.dtype_size != 0
+            || upload.bytes.len() % binding.dtype_size != 0
+            || end.is_none_or(|end| end > binding.nbytes)
         {
             return Err(Error::execution(
                 ExecutionError::Upload,
                 format!("unaligned or out-of-range upload: {}", upload.buffer),
             ));
         }
-        let resolved = ResolvedUpload {
-            host_offset: binding.host_offset + upload.offset,
-            device_address: buffer.address + upload.offset,
+        let host_offset = binding.host_offset + upload.offset;
+        let host_end = host_offset + upload.bytes.len();
+        if !overlap_scratch.is_empty() && host_offset < prev_end {
+            sorted = false;
+        }
+        prev_end = host_end;
+        overlap_scratch.push((host_offset, host_end));
+        storage.push(ResolvedUpload {
+            host_offset,
+            device_address: binding.device_address + upload.offset,
             nbytes: upload.bytes.len(),
-        };
-        // Manifest validation makes different buffers' host spans disjoint.
-        if storage.iter().any(|prior| {
-            prior.host_offset < resolved.host_offset + resolved.nbytes
-                && resolved.host_offset < prior.host_offset + prior.nbytes
-        }) {
+        });
+    }
+    // Manifest validation makes different buffers' host spans disjoint.
+    // All spans are nonempty (`host_offset < host_end`); when not already
+    // strictly increasing without overlap, sort by start offset and check
+    // adjacent intervals in O(U log U).
+    if !sorted {
+        overlap_scratch.sort_unstable_by_key(|&(start, _)| start);
+        if overlap_scratch.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+            storage.clear();
             return Err(Error::execution(
                 ExecutionError::Upload,
                 "uploads overlap within one input buffer",
             ));
         }
-        storage.push(resolved);
     }
     let mut logprobs = 0u64;
     if graph.kind.samples() {
@@ -1327,12 +1599,22 @@ pub(super) fn validate_uploads<'uploads, 'bytes, 'storage>(
         }
     }
     let mut logprob_width = if logprobs != 0 {
-        (manifest.buffer("completion_logprobs")?.shape[3] / 2 - 1).min(super::MAX_TOP_LOGPROBS)
+        let fields = match index {
+            Some(idx) => idx.completion_logprobs.ok_or_else(|| {
+                Error::execution(ExecutionError::Manifest, "unknown buffer \"completion_logprobs\"")
+            })?.2,
+            None => manifest.buffer("completion_logprobs")?.shape[3],
+        };
+        (fields / 2 - 1).min(super::MAX_TOP_LOGPROBS)
     } else {
         0
     };
     let mut logprob_token_ids = Vec::new();
-    if graph.kind.samples() && manifest.logprob_token_id_capacity() != 0 {
+    let logprob_token_id_capacity = match index {
+        Some(idx) => idx.logprob_token_id_capacity,
+        None => manifest.logprob_token_id_capacity(),
+    };
+    if graph.kind.samples() && logprob_token_id_capacity != 0 {
         let capacity = manifest.request_capacity();
         if !uploads.iter().any(|u| {
             u.buffer == "logprob_requested" && u.offset == 0 && u.bytes.len() == capacity * 4
@@ -1391,6 +1673,12 @@ pub(super) fn validate_uploads<'uploads, 'bytes, 'storage>(
     })
 }
 
+#[inline]
+fn read_i64_le_at(bytes: &[u8; 64], field: usize) -> i64 {
+    let start = field * 8;
+    i64::from_le_bytes(bytes[start..start + 8].try_into().unwrap())
+}
+
 pub(super) fn decode_records(
     bytes: &[u8],
     fence: Fence,
@@ -1406,60 +1694,93 @@ pub(super) fn decode_records(
             "completion extent mismatch",
         ));
     }
-    let mut records = CompletionRecords {
-        records: vec![CompletionRecord::default(); capacity],
-    };
-    for (record, bytes) in records.iter_mut().zip(bytes.chunks_exact(fields * 8)) {
-        let mut fields = vec![0i64; fields];
-        for (field, bytes) in fields.iter_mut().zip(bytes.chunks_exact(8)) {
-            *field = i64::from_le_bytes(bytes.try_into().unwrap());
+    let token_capacity = fields - COMPLETION_METADATA_FIELDS;
+    let mut records = Vec::with_capacity(capacity);
+    for row in bytes.chunks_exact(fields * 8) {
+        let header: &[u8; 64] = row[..64].try_into().unwrap();
+        let generation = read_i64_le_at(header, 0);
+        let submission_sequence = read_i64_le_at(header, 1);
+        let consumed_tokens = read_i64_le_at(header, 2);
+        let generated_tokens = read_i64_le_at(header, 3);
+        let token_id = read_i64_le_at(header, 4);
+        let status = read_i64_le_at(header, 5);
+        let error_code = read_i64_le_at(header, 6);
+        let reserved = read_i64_le_at(header, 7);
+        if status == 0 {
+            if reserved != 0 {
+                return Err(Error::execution(
+                    ExecutionError::Completion,
+                    "invalid or stale device completion record",
+                ));
+            }
+            records.push(CompletionRecord {
+                generation,
+                submission_sequence,
+                consumed_tokens,
+                generated_tokens,
+                token_id,
+                status,
+                error_code,
+                reserved,
+                vector: None,
+            });
+            continue;
         }
-        *record = CompletionRecord {
-            generation: fields[0],
-            submission_sequence: fields[1],
-            consumed_tokens: fields[2],
-            generated_tokens: fields[3],
-            token_id: fields[4],
-            status: fields[5],
-            error_code: fields[6],
-            reserved: fields[7],
-            vector: Some(TokenVector {
-                emitted_count: fields[8],
-                offered_drafts: fields[9],
-                accepted_drafts: fields[10],
-                copy_offered_mask: fields[11],
-                model_reserved: fields[12],
-                draft_cache_consumed: fields[13],
-                verification_width: fields[15],
-                tokens: fields[COMPLETION_METADATA_FIELDS..].to_vec(),
-            }),
-        };
-        if record.status != 0 && fields[14] != 0 {
+        let meta: &[u8; 64] = row[64..128].try_into().unwrap();
+        if read_i64_le_at(meta, 6) != 0 {
             return Err(Error::execution(
                 ExecutionError::Completion,
                 "reserved vector completion field must be zero",
             ));
         }
+        let mut tokens = Vec::with_capacity(token_capacity);
+        for chunk in row[COMPLETION_METADATA_FIELDS * 8..].chunks_exact(8) {
+            tokens.push(i64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let record = CompletionRecord {
+            generation,
+            submission_sequence,
+            consumed_tokens,
+            generated_tokens,
+            token_id,
+            status,
+            error_code,
+            reserved,
+            vector: Some(TokenVector {
+                emitted_count: read_i64_le_at(meta, 0),
+                offered_drafts: read_i64_le_at(meta, 1),
+                accepted_drafts: read_i64_le_at(meta, 2),
+                copy_offered_mask: read_i64_le_at(meta, 3),
+                model_reserved: read_i64_le_at(meta, 4),
+                draft_cache_consumed: read_i64_le_at(meta, 5),
+                verification_width: read_i64_le_at(meta, 7),
+                tokens,
+            }),
+        };
         record.validate_vector()?;
         if !(0..=3).contains(&record.status)
             || record.reserved != 0
-            || (record.status != 0
-                && (record.generation <= 0
-                    || record.submission_sequence != fence.0 as i64
-                    || record.consumed_tokens < 0
-                    || record.generated_tokens < 0
-                    || record.token_id < -1
-                    || (record.status != 3 && record.error_code != 0)))
+            || record.generation <= 0
+            || record.submission_sequence != fence.0 as i64
+            || record.consumed_tokens < 0
+            || record.generated_tokens < 0
+            || record.token_id < -1
+            || (record.status != 3 && record.error_code != 0)
         {
             return Err(Error::execution(
                 ExecutionError::Completion,
                 "invalid or stale device completion record",
             ));
         }
+        records.push(record);
     }
-    Ok(records)
+    Ok(CompletionRecords {
+        records,
+        token_capacity,
+    })
 }
 
+#[cfg(test)]
 pub(super) fn decode_logprobs(
     bytes: &[u8],
     records: &[CompletionRecord],
@@ -1468,7 +1789,19 @@ pub(super) fn decode_logprobs(
     requested: u64,
     selections: &[Vec<u32>],
 ) -> Result<Vec<Vec<Option<TokenLogprobs>>>> {
-    let token_capacity = records.first().and_then(|r| r.vector.as_ref()).map_or(DEFAULT_COMPLETION_TOKEN_CAPACITY, |v| v.tokens.len());
+    let token_capacity = infer_token_capacity(records);
+    decode_logprobs_with_capacity(bytes, records, token_capacity, k, fields, requested, selections)
+}
+
+fn decode_logprobs_with_capacity(
+    bytes: &[u8],
+    records: &[CompletionRecord],
+    token_capacity: usize,
+    k: usize,
+    fields: usize,
+    requested: u64,
+    selections: &[Vec<u32>],
+) -> Result<Vec<Vec<Option<TokenLogprobs>>>> {
     if !(1..=super::MAX_TOP_LOGPROBS).contains(&k)
         || fields < 2 + 2 * k
         || fields > super::LOGPROB_FIELDS
@@ -1654,6 +1987,360 @@ mod input_copy_tests {
             Ok(())
         }).unwrap();
         batches.submit(8192, std::iter::empty(), |_, _, _| panic!("empty input must not enqueue")).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hotpath_microbench_tests {
+    use super::*;
+    use crate::execution::{BufferDescriptor, Dtype, GraphDescriptor, InputBinding, SamplingMode};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn manifest_64_lanes() -> ExecutionManifest {
+        const FIELDS: usize = COMPLETION_METADATA_FIELDS + 16;
+        let mut buffers = vec![
+            BufferDescriptor {
+                name: "frame_index".into(),
+                address: 0x1000,
+                nbytes: 4,
+                dtype: Dtype::Int32,
+                shape: vec![1],
+                strides: vec![1],
+            },
+            BufferDescriptor {
+                name: "submission_sequence".into(),
+                address: 0x2000,
+                nbytes: 8,
+                dtype: Dtype::Int64,
+                shape: vec![1],
+                strides: vec![1],
+            },
+            BufferDescriptor {
+                name: "completion_records".into(),
+                address: 0x10_000,
+                nbytes: 2 * REQUEST_LANES * FIELDS * 8,
+                dtype: Dtype::Int64,
+                shape: vec![2, REQUEST_LANES, FIELDS],
+                strides: vec![REQUEST_LANES * FIELDS, FIELDS, 1],
+            },
+        ];
+        let mut input_bindings = vec![
+            InputBinding { buffer_name: "frame_index".into(), host_offset: 0, nbytes: 4 },
+            InputBinding { buffer_name: "submission_sequence".into(), host_offset: 8, nbytes: 8 },
+        ];
+        let mut dev_addr = 0x100_000usize;
+        let mut host_off = 16usize;
+        for idx in 0..20usize {
+            let name = format!("input_buf_{idx:02}");
+            let nbytes = REQUEST_LANES * 8;
+            buffers.push(BufferDescriptor {
+                name: name.clone(),
+                address: dev_addr,
+                nbytes,
+                dtype: Dtype::Int64,
+                shape: vec![REQUEST_LANES],
+                strides: vec![1],
+            });
+            input_bindings.push(InputBinding { buffer_name: name, host_offset: host_off, nbytes });
+            dev_addr += 0x10_000;
+            host_off += nbytes;
+        }
+        ExecutionManifest {
+            engram: None,
+            collectives: None,
+            cache: None,
+            offload: None,
+            abi_version: super::super::ABI_VERSION,
+            completion_token_capacity: 16,
+            context: 1,
+            device: 0,
+            max_active: REQUEST_LANES,
+            input_frame_bytes: host_off,
+            buffers,
+            graphs: vec![GraphDescriptor {
+                confidence_width: 0,
+                draft_tokens: 0,
+                name: "decode64".into(),
+                kind: GraphKind::Decode,
+                sampling_mode: SamplingMode::General,
+                handle: 0x5000,
+                batch_capacity: REQUEST_LANES,
+                token_capacity: 1,
+                packed_token_capacity: 0,
+                prefill_capacity: 0,
+                estimated_duration_ns: 1_000_000,
+                input_bindings,
+                tuned_bindings: vec![],
+            }],
+            tuning_graphs: vec![],
+            persistent_workers: vec![],
+        }
+    }
+
+    #[test]
+    fn microbench_validate_uploads_and_decode_records_64_lanes() {
+        let manifest = manifest_64_lanes();
+        manifest.validate().unwrap();
+        let payload = [7u8; 8];
+        let full_row = [9u8; REQUEST_LANES * 8];
+        // 4 per-lane partial buffers (256 uploads, reversed per buffer to stress overlap check) + 8 full-row uploads = 264 uploads.
+        let mut uploads = Vec::with_capacity(264);
+        for buf in ["input_buf_16", "input_buf_17", "input_buf_18", "input_buf_19"] {
+            for lane in (0..REQUEST_LANES).rev() {
+                uploads.push(Upload { buffer: buf, offset: lane * 8, bytes: &payload });
+            }
+        }
+        for buf in [
+            "input_buf_08", "input_buf_09", "input_buf_10", "input_buf_11",
+            "input_buf_12", "input_buf_13", "input_buf_14", "input_buf_15",
+        ] {
+            uploads.push(Upload { buffer: buf, offset: 0, bytes: &full_row });
+        }
+        let mut storage = Vec::with_capacity(uploads.len());
+        let index = ManifestIndex::build(&manifest).unwrap();
+        let mut overlap_scratch = Vec::with_capacity(uploads.len());
+        const UPLOAD_ITERS: u32 = 2_000;
+        let start = Instant::now();
+        for _ in 0..UPLOAD_ITERS {
+            let resolved = validate_uploads(&manifest, 0, black_box(&uploads), &mut storage).unwrap();
+            black_box(resolved.bindings.len());
+        }
+        let validate_unindexed_ns = start.elapsed().as_nanos() as f64 / f64::from(UPLOAD_ITERS);
+
+        const INDEXED_ITERS: u32 = 10_000;
+        let start = Instant::now();
+        for _ in 0..INDEXED_ITERS {
+            let resolved = validate_uploads_indexed(
+                &manifest,
+                &index,
+                0,
+                black_box(&uploads),
+                &mut storage,
+                &mut overlap_scratch,
+            )
+            .unwrap();
+            black_box(resolved.bindings.len());
+        }
+        let validate_indexed_unsorted_ns = start.elapsed().as_nanos() as f64 / f64::from(INDEXED_ITERS);
+
+        let mut sorted_uploads = Vec::with_capacity(264);
+        for buf in [
+            "input_buf_08", "input_buf_09", "input_buf_10", "input_buf_11",
+            "input_buf_12", "input_buf_13", "input_buf_14", "input_buf_15",
+        ] {
+            sorted_uploads.push(Upload { buffer: buf, offset: 0, bytes: &full_row });
+        }
+        for buf in ["input_buf_16", "input_buf_17", "input_buf_18", "input_buf_19"] {
+            for lane in 0..REQUEST_LANES {
+                sorted_uploads.push(Upload { buffer: buf, offset: lane * 8, bytes: &payload });
+            }
+        }
+        let start = Instant::now();
+        for _ in 0..INDEXED_ITERS {
+            let resolved = validate_uploads_indexed(
+                &manifest,
+                &index,
+                0,
+                black_box(&sorted_uploads),
+                &mut storage,
+                &mut overlap_scratch,
+            )
+            .unwrap();
+            black_box(resolved.bindings.len());
+        }
+        let validate_indexed_sorted_ns = start.elapsed().as_nanos() as f64 / f64::from(INDEXED_ITERS);
+
+        const FIELDS: usize = COMPLETION_METADATA_FIELDS + 16;
+        let make_frame = |active_lanes: usize| -> Vec<u8> {
+            let mut bytes = vec![0u8; REQUEST_LANES * FIELDS * 8];
+            for slot in 0..active_lanes {
+                let mut record = CompletionRecord {
+                    generation: (slot + 1) as i64,
+                    submission_sequence: 42,
+                    consumed_tokens: 128,
+                    generated_tokens: 4,
+                    token_id: 1003,
+                    status: 1,
+                    error_code: 0,
+                    reserved: 0,
+                    vector: Some(TokenVector {
+                        emitted_count: 4,
+                        offered_drafts: 3,
+                        accepted_drafts: 3,
+                        copy_offered_mask: 0,
+                        model_reserved: -1,
+                        draft_cache_consumed: 0,
+                        verification_width: 4,
+                        tokens: vec![-1; 16],
+                    }),
+                };
+                record.vector.as_mut().unwrap().tokens[..4].copy_from_slice(&[1000, 1001, 1002, 1003]);
+                let start = slot * FIELDS * 8;
+                for (dst, field) in bytes[start..start + FIELDS * 8].chunks_exact_mut(8).zip(record.fields()) {
+                    dst.copy_from_slice(&field.to_le_bytes());
+                }
+            }
+            bytes
+        };
+
+        let frame_64 = make_frame(64);
+        let frame_1 = make_frame(1);
+        const DECODE_ITERS: u32 = 20_000;
+
+        let start = Instant::now();
+        for _ in 0..DECODE_ITERS {
+            let decoded = decode_records(black_box(&frame_64), Fence(42), REQUEST_LANES, FIELDS).unwrap();
+            black_box(decoded.len());
+        }
+        let decode_64_ns = start.elapsed().as_nanos() as f64 / f64::from(DECODE_ITERS);
+
+        let start = Instant::now();
+        for _ in 0..DECODE_ITERS {
+            let decoded = decode_records(black_box(&frame_1), Fence(42), REQUEST_LANES, FIELDS).unwrap();
+            black_box(decoded.len());
+        }
+        let decode_1_ns = start.elapsed().as_nanos() as f64 / f64::from(DECODE_ITERS);
+
+        eprintln!(
+            "[microbench] validate_uploads(64 lanes, 264 uploads): unindexed={validate_unindexed_ns:.1} ns/op, \
+             indexed_unsorted={validate_indexed_unsorted_ns:.1} ns/op, indexed_sorted={validate_indexed_sorted_ns:.1} ns/op | \
+             decode_records(64 active): {decode_64_ns:.1} ns/op | \
+             decode_records(1 active / 63 inactive): {decode_1_ns:.1} ns/op"
+        );
+    }
+
+    #[test]
+    fn indexed_upload_validation_preserves_staging_order_and_overlap_errors() {
+        let manifest = manifest_64_lanes();
+        manifest.validate().unwrap();
+        let index = ManifestIndex::build(&manifest).unwrap();
+        let mut storage = Vec::new();
+        let mut scratch = Vec::new();
+
+        // Out-of-order disjoint uploads must succeed and preserve original upload order in `stage`.
+        let b0 = [0x11u8; 8];
+        let b1 = [0x22u8; 8];
+        let b2 = [0x33u8; 8];
+        let unordered = [
+            Upload { buffer: "input_buf_05", offset: 16, bytes: &b2 },
+            Upload { buffer: "input_buf_05", offset: 0, bytes: &b0 },
+            Upload { buffer: "input_buf_05", offset: 8, bytes: &b1 },
+        ];
+        let mut frame_indexed = vec![0u8; manifest.input_frame_bytes];
+        let mut frame_unindexed = vec![0u8; manifest.input_frame_bytes];
+        validate_uploads_indexed(&manifest, &index, 0, &unordered, &mut storage, &mut scratch)
+            .unwrap()
+            .stage(&mut frame_indexed, 1, 9);
+        validate_uploads(&manifest, 0, &unordered, &mut storage)
+            .unwrap()
+            .stage(&mut frame_unindexed, 1, 9);
+        assert_eq!(frame_indexed, frame_unindexed);
+
+        // Non-adjacent overlapping uploads (first and last) must fail with Upload domain.
+        let wide = [0x44u8; 16];
+        let overlap = [
+            Upload { buffer: "input_buf_05", offset: 0, bytes: &wide },
+            Upload { buffer: "input_buf_05", offset: 24, bytes: &b2 },
+            Upload { buffer: "input_buf_05", offset: 8, bytes: &b1 },
+        ];
+        let err = validate_uploads_indexed(&manifest, &index, 0, &overlap, &mut storage, &mut scratch)
+            .err()
+            .expect("overlapping uploads must fail");
+        assert!(matches!(err, Error::Execution(ExecutionError::Upload(_))));
+        assert_eq!(err.to_string(), "uploads overlap within one input buffer");
+        assert!(storage.is_empty());
+
+        // Reserved, unbound, misaligned, and out-of-bounds uploads must fail with Upload domain.
+        for bad in [
+            vec![Upload { buffer: "frame_index", offset: 0, bytes: &[0; 4] }],
+            vec![Upload { buffer: "missing_buf", offset: 0, bytes: &b0 }],
+            vec![Upload { buffer: "input_buf_05", offset: 4, bytes: &b0 }],
+            vec![Upload { buffer: "input_buf_05", offset: REQUEST_LANES * 8, bytes: &b0 }],
+        ] {
+            let err = validate_uploads_indexed(&manifest, &index, 0, &bad, &mut storage, &mut scratch)
+                .err()
+                .expect("invalid upload must fail");
+            assert!(matches!(err, Error::Execution(ExecutionError::Upload(_))));
+        }
+    }
+
+    #[test]
+    fn decode_records_omits_inactive_vectors_and_preserves_wire_and_tp_agreement() {
+        const CAPACITY: usize = 4;
+        const TOKENS: usize = 16;
+        const FIELDS: usize = COMPLETION_METADATA_FIELDS + TOKENS;
+        let mut bytes = vec![0u8; CAPACITY * FIELDS * 8];
+        // Slot 0 inactive with non-zero epoch metadata (must be preserved, vector omitted).
+        bytes[0..8].copy_from_slice(&5i64.to_le_bytes());
+        // Slot 2 active with valid token vector.
+        let mut active = CompletionRecord {
+            generation: 11,
+            submission_sequence: 7,
+            consumed_tokens: 65,
+            generated_tokens: 2,
+            token_id: 99,
+            status: 1,
+            error_code: 0,
+            reserved: 0,
+            vector: Some(TokenVector {
+                emitted_count: 2,
+                offered_drafts: 1,
+                accepted_drafts: 1,
+                copy_offered_mask: 0,
+                model_reserved: -1,
+                draft_cache_consumed: 0,
+                verification_width: 2,
+                tokens: vec![-1; TOKENS],
+            }),
+        };
+        active.vector.as_mut().unwrap().tokens[..2].copy_from_slice(&[88, 99]);
+        let start = 2 * FIELDS * 8;
+        for (dst, field) in bytes[start..start + FIELDS * 8].chunks_exact_mut(8).zip(active.fields()) {
+            dst.copy_from_slice(&field.to_le_bytes());
+        }
+
+        let decoded = decode_records(&bytes, Fence(7), CAPACITY, FIELDS).unwrap();
+        assert_eq!(decoded.token_capacity(), TOKENS);
+        assert_eq!(decoded[0].status, 0);
+        assert_eq!(decoded[0].generation, 5);
+        assert!(decoded[0].vector.is_none(), "inactive slot must not allocate a TokenVector");
+        assert_eq!(decoded[2], active);
+
+        // Wire serialization and decoding round-trip cleanly with mixed active/inactive slots.
+        let mut wire = Vec::new();
+        decoded.write_wire_bytes(&mut wire);
+        assert_eq!(wire.len(), bytes.len());
+        let roundtrip = decode_records(&wire, Fence(7), CAPACITY, FIELDS).unwrap();
+        assert_eq!(roundtrip[0], decoded[0]);
+        assert_eq!(roundtrip[2], active);
+
+        // TP agreement with proposal confidence succeeds when inactive slots omit TokenVector.
+        let completion = FrameCompletion {
+            fence: Fence(7),
+            graph_index: 0,
+            timing: Default::default(),
+            records: decoded,
+            logprobs: None,
+            prompt_logprobs: None,
+            proposal_confidence: Some(vec![vec![0.5; TOKENS - 1]; CAPACITY]),
+            speculative_survival: None,
+        };
+        let peer = FrameCompletion {
+            fence: Fence(7),
+            graph_index: 0,
+            timing: Default::default(),
+            records: roundtrip,
+            logprobs: None,
+            prompt_logprobs: None,
+            proposal_confidence: Some(vec![vec![0.4; TOKENS - 1]; CAPACITY]),
+            speculative_survival: None,
+        };
+        super::super::parallel::agree_speculative(&completion, &peer).unwrap();
+
+        // Non-zero reserved word on an inactive slot must still be rejected.
+        bytes[7 * 8..8 * 8].copy_from_slice(&1i64.to_le_bytes());
+        assert!(decode_records(&bytes, Fence(7), CAPACITY, FIELDS).is_err());
     }
 }
 

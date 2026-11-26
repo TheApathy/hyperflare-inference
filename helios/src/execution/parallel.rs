@@ -431,8 +431,12 @@ pub(super) fn agree(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()
         (None, None) => {}
         (Some(root_values), Some(peer_values)) => {
             for (values, records) in [(root_values, &root.records), (peer_values, &peer.records)] {
-                if values.len() != records.len() || values.iter().zip(records.iter()).any(|(row, record)|
-                    record.vector.as_ref().is_none_or(|vector| row.len() + 1 != vector.tokens.len())) {
+                if values.len() != records.len() || values.iter().zip(records.iter()).any(|(row, record)| {
+                    record.vector.as_ref().map_or_else(
+                        || record.status != 0 || row.len() + 1 != records.token_capacity(),
+                        |vector| row.len() + 1 != vector.tokens.len(),
+                    )
+                }) {
                     return Err(invalid("proposal confidence geometry differs from completion capacity"));
                 }
             }

@@ -112,6 +112,8 @@ struct SurplusHistory {
     deep_next: usize,
     depth_one: Vec<(f32, f32)>,
     depth_one_next: usize,
+    /// Per-depth memoized tables, cleared on every ring mutation in `push`.
+    cache: std::cell::RefCell<Vec<(usize, Option<Arc<SurplusTable>>)>>,
 }
 
 impl SurplusHistory {
@@ -121,11 +123,13 @@ impl SurplusHistory {
             deep_next: 0,
             depth_one: Vec::with_capacity(SURPLUS_HISTORY_CAPACITY),
             depth_one_next: 0,
+            cache: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     fn push(&mut self, actual: Vec<f32>, forecast: Vec<f32>) {
         debug_assert_eq!(actual.len(), forecast.len());
+        let mut mutated = false;
         if let (Some(&a0), Some(&f0)) = (actual.first(), forecast.first()) {
             if self.depth_one.len() < SURPLUS_HISTORY_CAPACITY {
                 self.depth_one.push((a0, f0));
@@ -133,6 +137,7 @@ impl SurplusHistory {
                 self.depth_one[self.depth_one_next] = (a0, f0);
                 self.depth_one_next = (self.depth_one_next + 1) % SURPLUS_HISTORY_CAPACITY;
             }
+            mutated = true;
         }
         if actual.len() >= 2 {
             if self.deep.len() < SURPLUS_HISTORY_CAPACITY {
@@ -141,6 +146,10 @@ impl SurplusHistory {
                 self.deep[self.deep_next] = (actual, forecast);
                 self.deep_next = (self.deep_next + 1) % SURPLUS_HISTORY_CAPACITY;
             }
+            mutated = true;
+        }
+        if mutated {
+            self.cache.get_mut().clear();
         }
     }
 
@@ -175,7 +184,7 @@ impl SurplusHistory {
         Some(Self::build_from_values(1, samples, actual_vals, forecast_vals))
     }
 
-    fn build_table(&self, depth: usize) -> Option<SurplusTable> {
+    fn build_table_uncached(&self, depth: usize) -> Option<SurplusTable> {
         if depth == 0 {
             return None;
         }
@@ -218,6 +227,18 @@ impl SurplusHistory {
             }
         }
         self.build_depth_one()
+    }
+
+    fn build_table(&self, depth: usize) -> Option<Arc<SurplusTable>> {
+        if depth == 0 {
+            return None;
+        }
+        if let Some((_, cached)) = self.cache.borrow().iter().find(|(d, _)| *d == depth) {
+            return cached.clone();
+        }
+        let built = self.build_table_uncached(depth).map(Arc::new);
+        self.cache.borrow_mut().push((depth, built.clone()));
+        built
     }
 }
 
@@ -345,7 +366,7 @@ impl Forecasts {
         self.surplus.push(actual, forecast);
     }
 
-    pub(super) fn surplus_table(&self, depth: usize) -> Option<SurplusTable> {
+    pub(super) fn surplus_table(&self, depth: usize) -> Option<Arc<SurplusTable>> {
         self.surplus.build_table(depth)
     }
 
@@ -883,4 +904,110 @@ impl RequestScheduler {
 /// Expected tokens from a round of `width` positions with powered prefix survival.
 pub(super) fn forecast_tokens(powered: &[f64], width: usize) -> f64 {
     f64::from(width != 0) + powered[..width.saturating_sub(1)].iter().sum::<f64>()
+}
+
+#[cfg(test)]
+mod surplus_tests {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn populated_history() -> SurplusHistory {
+        let mut history = SurplusHistory::new();
+        let easy = vec![0.96f32, 0.92, 0.88, 0.83, 0.78, 0.72, 0.65];
+        let hard = vec![0.35f32, 0.20, 0.12, 0.07, 0.04, 0.02, 0.01];
+        let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
+        for i in 0..SURPLUS_HISTORY_CAPACITY {
+            let actual = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+            history.push(actual, mean.clone());
+        }
+        history
+    }
+
+    #[test]
+    fn cached_surplus_table_matches_uncached_and_invalidates_on_mutation() {
+        let mut history = SurplusHistory::new();
+        assert!(history.build_table(0).is_none());
+        assert!(history.build_table(1).is_none());
+        assert!(history.build_table(7).is_none());
+
+        let assert_matches = |h: &SurplusHistory, depth: usize| {
+            let uncached = h.build_table_uncached(depth);
+            let cached_a = h.build_table(depth);
+            let cached_b = h.build_table(depth);
+            match (uncached, cached_a, cached_b) {
+                (None, None, None) => {}
+                (Some(expected), Some(a), Some(b)) => {
+                    assert!(Arc::ptr_eq(&a, &b), "repeated depth={depth} query must reuse cached Arc");
+                    assert_eq!(a.depth, expected.depth);
+                    assert_eq!(a.samples, expected.samples);
+                    assert_eq!(a.actual_prefix, expected.actual_prefix);
+                    assert_eq!(a.forecast_prefix, expected.forecast_prefix);
+                    for (lanes, budget) in [(2, 1), (8, 8), (16, 32), (32, 48)] {
+                        assert_eq!(
+                            a.factor(lanes, budget, 1.0).to_bits(),
+                            expected.factor(lanes, budget, 1.0).to_bits()
+                        );
+                    }
+                }
+                _ => panic!("cached and uncached presence diverged for depth={depth}"),
+            }
+        };
+
+        // Populate depth-1 history only: deeper queries fall back to depth 1.
+        for i in 0..SURPLUS_MIN_SAMPLES {
+            let actual = if i % 2 == 0 { vec![0.95] } else { vec![0.25] };
+            history.push(actual, vec![0.60]);
+        }
+        for depth in [0, 1, 2, 4, 7] {
+            assert_matches(&history, depth);
+        }
+        let d1_before = history.build_table(1).unwrap();
+
+        // Pushing deeper curves invalidates cached tables across every depth.
+        let easy = vec![0.96f32, 0.92, 0.88, 0.83, 0.78, 0.72, 0.65];
+        let hard = vec![0.35f32, 0.20, 0.12, 0.07, 0.04, 0.02, 0.01];
+        let mean: Vec<f32> = easy.iter().zip(&hard).map(|(a, b)| 0.5 * (a + b)).collect();
+        for i in 0..SURPLUS_HISTORY_CAPACITY + 16 {
+            let actual = if i % 2 == 0 { easy.clone() } else { hard.clone() };
+            history.push(actual, mean.clone());
+            if i == SURPLUS_MIN_SAMPLES || i == SURPLUS_HISTORY_CAPACITY + 15 {
+                for depth in [0, 1, 2, 4, 7] {
+                    assert_matches(&history, depth);
+                }
+            }
+        }
+        let d1_after = history.build_table(1).unwrap();
+        assert!(!Arc::ptr_eq(&d1_before, &d1_after), "push must invalidate previously cached table");
+    }
+
+    #[test]
+    fn microbench_surplus_history_build_table() {
+        let history = populated_history();
+        const COLD_ITERS: u32 = 2_000;
+        const HOT_ITERS: u32 = 200_000;
+
+        let start = Instant::now();
+        for _ in 0..COLD_ITERS {
+            let table = history.build_table_uncached(black_box(7)).unwrap();
+            black_box(table.factor(16, 32, 1.0));
+        }
+        let cold_ns = start.elapsed().as_nanos() as f64 / f64::from(COLD_ITERS);
+
+        // Prime cache with one query before measuring repeated planning lookups.
+        let primed = history.build_table(7).unwrap();
+        black_box(primed.factor(16, 32, 1.0));
+
+        let start = Instant::now();
+        for _ in 0..HOT_ITERS {
+            let table = history.build_table(black_box(7)).unwrap();
+            black_box(table.factor(16, 32, 1.0));
+        }
+        let cached_ns = start.elapsed().as_nanos() as f64 / f64::from(HOT_ITERS);
+
+        eprintln!(
+            "[microbench] SurplusHistory::build_table(depth=7, n=256): cold={cold_ns:.1} ns/op | cached={cached_ns:.1} ns/op ({:.1}x)",
+            cold_ns / cached_ns.max(0.01)
+        );
+    }
 }

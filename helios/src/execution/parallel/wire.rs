@@ -404,11 +404,7 @@ pub(super) fn completion(value: &FrameCompletion) -> Vec<u8> {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
-    for record in value.records.iter() {
-        for field in record.fields() {
-            bytes.extend_from_slice(&field.to_le_bytes());
-        }
-    }
+    value.records.write_wire_bytes(&mut bytes);
     bytes
 }
 

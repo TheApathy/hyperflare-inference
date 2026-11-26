@@ -715,6 +715,7 @@ impl ModelRuntime {
                     receiver,
                     queue_capacity,
                 );
+                worker.estimate_ttl_ns = policy.estimate_ttl_ns;
                 worker.attach_store(store);
                 if worker.config.contract.vision.enabled() {
                     worker.image_preparation = Some(ImagePreparation::new(worker_input_store));
@@ -1050,6 +1051,24 @@ impl Drop for ImagePreparation {
     }
 }
 
+/// Upper bound between re-planning checks while a submission window remains open
+/// and the previous plan returned `None`, bounding estimate TTL wakeup latency
+/// without re-evaluating `RequestScheduler::plan` on every spin iteration.
+const MAX_OPEN_WINDOW_REPLAN_INTERVAL_NS: u64 = 1_000_000;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PlanWait {
+    #[default]
+    Ready,
+    /// Submission window is closed (two frames in flight, an in-flight feedback
+    /// operation, or the expected-finish window elapsed); passage of time alone
+    /// cannot reopen the window before a completion or state change.
+    UntilProgress,
+    /// Submission window remained open when `plan()` returned `None`; re-check on
+    /// any progress event or once the monotonic clock reaches this deadline.
+    UntilProgressOr(u64),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CopyoutResources {
     completed: crate::cache::Fence,
@@ -1087,6 +1106,10 @@ struct Worker<'a> {
     preparing_image: Option<RequestHandle>,
     image_preparation_cursor: usize,
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
+    plan_wait: PlanWait,
+    estimate_ttl_ns: u64,
+    #[cfg(test)]
+    plan_evaluations: usize,
 }
 
 impl<'a> Worker<'a> {
@@ -1123,7 +1146,24 @@ impl<'a> Worker<'a> {
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
+            plan_wait: PlanWait::Ready,
+            estimate_ttl_ns: crate::scheduler::PolicyConfig::default().estimate_ttl_ns,
+            #[cfg(test)]
+            plan_evaluations: 0,
         }
+    }
+
+    fn invalidate_plan(&mut self) {
+        self.plan_wait = PlanWait::Ready;
+    }
+
+    fn note_empty_plan(&mut self, now_ns: u64) {
+        self.plan_wait = if !self.scheduler.submission_window_available(1) {
+            PlanWait::UntilProgress
+        } else {
+            let wake_ns = self.estimate_ttl_ns.min(MAX_OPEN_WINDOW_REPLAN_INTERVAL_NS);
+            PlanWait::UntilProgressOr(now_ns.saturating_add(wake_ns))
+        };
     }
 
     fn run(&mut self, executor: &mut RankExecutor) -> Result<()> {
@@ -1140,10 +1180,18 @@ impl<'a> Worker<'a> {
             }
             progress |= self.publish()?;
             progress |= self.service_store()?;
+            if progress {
+                self.invalidate_plan();
+            }
             let (step, planned) = self.plan(executor.outstanding())?;
             progress |= planned;
             if let Some(step) = step {
-                progress |= self.submit(executor, &step)?;
+                if self.submit(executor, &step)? {
+                    progress = true;
+                    self.invalidate_plan();
+                } else if executor.outstanding() > 0 {
+                    self.note_empty_plan(super::observation::monotonic_ns());
+                }
             }
             if progress {
                 self.metrics.scheduler(self.scheduler.stats());
@@ -1614,6 +1662,9 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+        if progress {
+            self.invalidate_plan();
+        }
         Ok(std::ops::ControlFlow::Continue(progress))
     }
 
@@ -1622,6 +1673,7 @@ impl<'a> Worker<'a> {
         kind: GraphKind,
         mut completion: crate::execution::FrameCompletion,
     ) -> Result<()> {
+        self.invalidate_plan();
         let completed_at_ns = super::observation::monotonic_ns();
         self.scheduler.advance_to(completed_at_ns)?;
         let measured_step = self.scheduler.submitted_step(completion.fence)?.clone();
@@ -1629,18 +1681,26 @@ impl<'a> Worker<'a> {
         if measured_step.kind != kind {
             return Err("completion graph kind differs from submitted step".into());
         }
-        for (row, lane) in measured_step.lanes.iter().enumerate() {
-            let record = &completion.records[lane.request.slot as usize];
-            if record.status != 0 {
-                crate::model::validate_completion(
-                    self.config,
-                    self.inputs
-                        .as_ref()
-                        .unwrap()
-                        .completion_contract(&measured_step)?,
-                    measured_step.lane_kind(row),
-                    record,
-                )?;
+        if measured_step
+            .lanes
+            .iter()
+            .any(|lane| completion.records[lane.request.slot as usize].status != 0)
+        {
+            let contract = self
+                .inputs
+                .as_ref()
+                .unwrap()
+                .completion_contract(&measured_step)?;
+            for (row, lane) in measured_step.lanes.iter().enumerate() {
+                let record = &completion.records[lane.request.slot as usize];
+                if record.status != 0 {
+                    crate::model::validate_completion(
+                        self.config,
+                        contract,
+                        measured_step.lane_kind(row),
+                        record,
+                    )?;
+                }
             }
         }
         let mut prefill = 0;
@@ -2035,6 +2095,9 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+        if progress {
+            self.invalidate_plan();
+        }
         Ok(progress)
     }
 
@@ -2118,11 +2181,29 @@ impl<'a> Worker<'a> {
     }
 
     fn plan(&mut self, outstanding: usize) -> Result<(Option<ScheduledPlan>, bool)> {
+        self.plan_at(outstanding, super::observation::monotonic_ns())
+    }
+
+    fn plan_at(&mut self, outstanding: usize, now_ns: u64) -> Result<(Option<ScheduledPlan>, bool)> {
         if self.retry_late_pool_answers()? {
+            self.invalidate_plan();
             return Ok((None, true));
         }
-        self.scheduler
-            .advance_to(super::observation::monotonic_ns())?;
+        self.scheduler.advance_to(now_ns)?;
+        if outstanding > 0 {
+            match self.plan_wait {
+                PlanWait::Ready => {}
+                PlanWait::UntilProgress => return Ok((None, false)),
+                PlanWait::UntilProgressOr(deadline_ns) if now_ns < deadline_ns => {
+                    return Ok((None, false));
+                }
+                PlanWait::UntilProgressOr(_) => {
+                    self.plan_wait = PlanWait::Ready;
+                }
+            }
+        } else {
+            self.plan_wait = PlanWait::Ready;
+        }
         let mut progress = false;
         if self.config.speculative_proposal_source
             == crate::scheduler::speculation::ProposalSource::Copy
@@ -2167,10 +2248,19 @@ impl<'a> Worker<'a> {
                 }
             }
         }
-        Ok((self.scheduler.plan(), progress))
+        #[cfg(test)]
+        {
+            self.plan_evaluations += 1;
+        }
+        let step = self.scheduler.plan();
+        if outstanding > 0 && step.is_none() {
+            self.note_empty_plan(now_ns);
+        }
+        Ok((step, progress))
     }
 
     fn reserve_and_pack(&mut self, step: &ScheduledPlan, fence: crate::cache::Fence) -> Result<()> {
+        self.invalidate_plan();
         self.scheduler.commit(step, fence)?;
         let inputs = self
             .inputs
@@ -2522,6 +2612,9 @@ impl<'a> Worker<'a> {
         self.metrics.store(store.stats());
         for handle in requeued {
             self.requeue(handle, false);
+        }
+        if progress {
+            self.invalidate_plan();
         }
         Ok(progress)
     }
@@ -3943,6 +4036,204 @@ mod tests {
         scheduler.cancel(active).unwrap();
         assert_eq!(scheduler.free_page_count(), 1);
         assert_eq!(scheduler.free_snapshot_count(), 2);
+    }
+
+    #[test]
+    fn worker_skips_redundant_planning_while_inflight_and_wakes_on_events_or_deadline() {
+        use crate::{
+            cache::Fence,
+            execution::{CompletionRecord, FrameCompletion},
+            scheduler::SchedulerLimits,
+        };
+
+        let frontend = super::super::stops::string_tests::frontend();
+        let mut config = ModelConfig {
+            completion_token_capacity: 16,
+            max_top_logprobs: 0,
+            logprob_token_id_capacity: 0,
+            prepared_sequence_tokens: 128,
+            contract: crate::model::testing::metadata(),
+            identity: [29; 32],
+            model_id: "plan-quiescence-test".into(),
+            limits: SchedulerLimits {
+                request_slots: 4,
+                max_active: 4,
+                max_sequence_tokens: 128,
+                prefill_chunk_size: 64,
+                pages: 16,
+                snapshots: 16,
+            },
+            eos_token_ids: vec![5],
+            sampling_ranges: Default::default(),
+            sampling_defaults: SamplingParameters::default(),
+            max_new_tokens: 16,
+            speculative_widths: vec![],
+            speculative_fixed_width: None,
+            speculative_token_capacity: 512,
+            decode_weight_bytes: 0,
+            history_drafts: false,
+            speculative_proposal_source: Default::default(),
+        };
+        for graph in &mut config.contract.graphs {
+            graph.inputs.retain(|binding| {
+                !matches!(
+                    binding.source,
+                    crate::model::contract::ValueSource::ImageFeatureIndex
+                        | crate::model::contract::ValueSource::ImageFeatureSlot
+                )
+            });
+        }
+        let manifest = crate::model::testing::manifest(&config);
+        let mut scheduler = RequestScheduler::new(
+            config.identity,
+            config.limits,
+            crate::model::scheduler_capabilities_with_manifest(&config, &manifest).unwrap(),
+        )
+        .unwrap();
+        let mut graphs = manifest.graphs.clone();
+        for graph in &mut graphs {
+            graph.estimated_duration_ns = match graph.kind {
+                GraphKind::Init | GraphKind::Snapshot => 100_000,
+                _ => 20_000_000,
+            };
+        }
+        scheduler.measured_graph_durations(&graphs).unwrap();
+
+        let stop = AtomicBool::new(false);
+        let metrics = Arc::new(super::super::metrics::Metrics::new(0, 0, 0, 16));
+        let (sender, receiver) = mpsc::channel();
+        let mut worker = Worker::new(&config, &frontend, &stop, &metrics, scheduler, receiver, 4);
+        worker.inputs = Some(crate::model::Inputs::new(&config, &manifest).unwrap());
+        worker.estimate_ttl_ns = 500_000; // 500 us TTL to test bounded open-window wakeup.
+
+        let make_req = |token: u32, max_new_tokens: u32| {
+            let (mut incoming, generation) = stream(16);
+            incoming.prompt.tokens = vec![token];
+            incoming.prompt.max_new_tokens = max_new_tokens;
+            incoming.prompt.data = PromptData {
+                positions: vec![[0; 3]],
+                vision_token_indices: vec![-1],
+                ..Default::default()
+            };
+            (incoming, generation)
+        };
+        let make_completion = |worker: &Worker<'_>, step: &ScheduledStep, seq: u64, sampled: Option<u32>| {
+            let mut records = vec![CompletionRecord::default(); 4];
+            for lane in &step.lanes {
+                let live = worker.scheduler.request(lane.request).unwrap();
+                records[lane.request.slot as usize] = CompletionRecord {
+                    generation: lane.request.generation as i64,
+                    submission_sequence: seq as i64,
+                    consumed_tokens: (lane.start_position + lane.tokens as u64) as i64,
+                    generated_tokens: live.generated_tokens as i64 + i64::from(sampled.is_some()),
+                    token_id: sampled.map_or(-1, i64::from),
+                    status: 1,
+                    ..Default::default()
+                };
+            }
+            FrameCompletion {
+                fence: Fence(seq),
+                graph_index: 0,
+                timing: Default::default(),
+                records: records.into(),
+                logprobs: None,
+                prompt_logprobs: None,
+                proposal_confidence: None,
+                speculative_survival: None,
+            }
+        };
+
+        let (req1, _gen1) = make_req(0, 8);
+        sender.send(vec![req1]).unwrap();
+        assert!(matches!(worker.admit().unwrap(), std::ops::ControlFlow::Continue(true)));
+
+        // 1. In-flight Init (feedback required -> closed window): repeated spin calls do not re-plan.
+        let init_step = worker.plan(0).unwrap().0.unwrap();
+        assert_eq!(init_step.kind, GraphKind::Init);
+        worker.reserve_and_pack(&init_step, Fence(1)).unwrap();
+
+        let evals_before = worker.plan_evaluations;
+        assert!(worker.plan(1).unwrap().0.is_none());
+        assert_eq!(worker.plan_evaluations, evals_before + 1);
+        assert_eq!(worker.plan_wait, PlanWait::UntilProgress);
+        for step in 1..=50 {
+            assert!(worker.plan(1).unwrap().0.is_none());
+            assert_eq!(
+                worker.plan_evaluations,
+                evals_before + 1,
+                "closed submission window must not re-run select_plan on spin {step}"
+            );
+        }
+
+        // Completion wakes planning immediately.
+        let frame = make_completion(&worker, &init_step, 1, None);
+        worker.complete(GraphKind::Init, frame).unwrap();
+        assert_eq!(worker.plan_wait, PlanWait::Ready);
+
+        // Advance req1 through Prefill + Snapshot into Decode.
+        let prefill = worker.plan(0).unwrap().0.unwrap();
+        assert_eq!(prefill.kind, GraphKind::Prefill);
+        worker.reserve_and_pack(&prefill, Fence(2)).unwrap();
+        let frame = make_completion(&worker, &prefill, 2, Some(1));
+        worker.complete(GraphKind::Prefill, frame).unwrap();
+
+        let snap = worker.plan(0).unwrap().0.unwrap();
+        assert_eq!(snap.kind, GraphKind::Snapshot);
+        worker.reserve_and_pack(&snap, Fence(3)).unwrap();
+        let frame = make_completion(&worker, &snap, 3, None);
+        worker.complete(GraphKind::Snapshot, frame).unwrap();
+
+        // 2. In-flight unconstrained Decode with open submission window, draining for a
+        //    newly admitted request's Init (winning feedback op -> plan() returns None while
+        //    submission_window_available(1) is true).
+        let decode = worker.plan(0).unwrap().0.unwrap();
+        assert_eq!(decode.kind, GraphKind::Decode);
+        worker.reserve_and_pack(&decode, Fence(4)).unwrap();
+
+        let (req2, gen2) = make_req(1, 8);
+        sender.send(vec![req2]).unwrap();
+        assert!(matches!(worker.admit().unwrap(), std::ops::ControlFlow::Continue(true)));
+
+        // First call sees Init beating Decode -> drains queue (returns None), enters UntilProgressOr.
+        let base_ns = super::super::observation::monotonic_ns();
+        let evals_before = worker.plan_evaluations;
+        assert!(worker.plan_at(1, base_ns).unwrap().0.is_none());
+        assert_eq!(worker.plan_evaluations, evals_before + 1);
+        assert!(matches!(worker.plan_wait, PlanWait::UntilProgressOr(_)));
+
+        // Spins before the 500 us TTL deadline skip select_plan.
+        for _ in 0..20 {
+            assert!(worker.plan_at(1, base_ns).unwrap().0.is_none());
+            assert_eq!(worker.plan_evaluations, evals_before + 1);
+        }
+
+        // Cancelling req2 clears quiescence and immediately allows the pipelined Decode for req1.
+        gen2.cancel();
+        assert!(matches!(worker.admit().unwrap(), std::ops::ControlFlow::Continue(true)));
+        assert_eq!(worker.plan_wait, PlanWait::Ready);
+        let pipelined = worker.plan(1).unwrap().0;
+        assert!(
+            pipelined.as_ref().is_some_and(|step| step.kind == GraphKind::Decode),
+            "cancelling the blocking feedback request must immediately wake pipelined Decode planning"
+        );
+
+        // 3. Re-entering open-window quiescence wakes once the monotonic clock reaches the TTL deadline.
+        let (req3, _gen3) = make_req(2, 8);
+        sender.send(vec![req3]).unwrap();
+        assert!(matches!(worker.admit().unwrap(), std::ops::ControlFlow::Continue(true)));
+        let mut now_ns = super::super::observation::monotonic_ns();
+        let evals_before = worker.plan_evaluations;
+        assert!(worker.plan_at(1, now_ns).unwrap().0.is_none());
+        assert_eq!(worker.plan_evaluations, evals_before + 1);
+        assert!(matches!(worker.plan_wait, PlanWait::UntilProgressOr(_)));
+        for _ in 0..20 {
+            now_ns += 10_000;
+            assert!(worker.plan_at(1, now_ns).unwrap().0.is_none());
+            assert_eq!(worker.plan_evaluations, evals_before + 1);
+        }
+        now_ns += 500_000;
+        assert!(worker.plan_at(1, now_ns).unwrap().0.is_none());
+        assert_eq!(worker.plan_evaluations, evals_before + 2);
     }
 }
 

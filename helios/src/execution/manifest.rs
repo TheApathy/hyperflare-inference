@@ -520,7 +520,12 @@ impl ExecutionManifest {
         Ok(())
     }
 
-    fn validate_tuning(&self) -> Result<()> {
+    fn validate_tuning(&self, buffers_by_name: &HashMap<&str, &BufferDescriptor>) -> Result<()> {
+        let buffer = |name: &str| -> Result<&BufferDescriptor> {
+            buffers_by_name.get(name).copied().ok_or_else(|| {
+                Error::execution(ExecutionError::Manifest, format!("unknown buffer {name:?}"))
+            })
+        };
         let host_inputs: HashSet<_> = self.graphs.iter().flat_map(|graph|
             graph.input_bindings.iter().map(|binding| binding.buffer_name.as_str())).collect();
         let mut names: HashSet<&str> = self.graphs.iter().map(|graph| graph.name.as_str()).collect();
@@ -530,13 +535,13 @@ impl ExecutionManifest {
             if graph.name.is_empty() || !names.insert(&graph.name) || graph.outputs.is_empty() {
                 return Err("tuning graphs require unique names and persistent outputs".into());
             }
-            let status = self.buffer(&graph.status_buffer)?;
+            let status = buffer(&graph.status_buffer)?;
             if status.dtype != Dtype::Int32 || status.shape != [1] || status.strides != [1]
                 || !statuses.insert(graph.status_buffer.as_str()) {
                 return Err("tuning status requires a unique int32[1] buffer".into());
             }
             for output in &graph.outputs {
-                self.buffer(output)?;
+                buffer(output)?;
                 if producers.insert(output.as_str(), graph.name.as_str()).is_some() {
                     return Err("tuning outputs require exactly one producer".into());
                 }
@@ -738,9 +743,9 @@ impl ExecutionManifest {
         }
         .validate()?;
         self.validate_persistent_workers()?;
-        let mut names = HashSet::new();
+        let mut buffers_by_name = HashMap::with_capacity(self.buffers.len());
         for buffer in &self.buffers {
-            if buffer.name.is_empty() || !names.insert(&buffer.name) {
+            if buffer.name.is_empty() || buffers_by_name.insert(buffer.name.as_str(), buffer).is_some() {
                 return Err(Error::execution(
                     ExecutionError::Manifest,
                     "buffer names must be nonempty and unique",
@@ -779,6 +784,11 @@ impl ExecutionManifest {
                 ));
             }
         }
+        let lookup_buffer = |name: &str| -> Result<&BufferDescriptor> {
+            buffers_by_name.get(name).copied().ok_or_else(|| {
+                Error::execution(ExecutionError::Manifest, format!("unknown buffer {name:?}"))
+            })
+        };
         let mut spans: Vec<_> = self
             .buffers
             .iter()
@@ -800,7 +810,7 @@ impl ExecutionManifest {
                 vec![2, self.request_capacity(), self.completion_fields()],
             ),
         ] {
-            let buffer = self.buffer(name)?;
+            let buffer = lookup_buffer(name)?;
             if buffer.dtype != dtype || buffer.shape != shape {
                 return Err(Error::execution(
                     ExecutionError::Manifest,
@@ -810,28 +820,36 @@ impl ExecutionManifest {
         }
         let logprobs = self.max_top_logprobs()? != 0;
         self.prompt_logprob_capacity()?;
-        if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
-            if buffer.dtype != Dtype::Float32
-                || buffer.shape != [2, self.request_capacity(), self.completion_token_capacity - 1] {
-                return Err("completion_speculative_survival requires two float32 frames of completion_token_capacity minus one prefixes per request slot".into());
-            }
+        if let Some(&buffer) = buffers_by_name.get("completion_speculative_survival")
+            && (buffer.dtype != Dtype::Float32
+                || buffer.shape != [2, self.request_capacity(), self.completion_token_capacity - 1])
+        {
+            return Err("completion_speculative_survival requires two float32 frames of completion_token_capacity minus one prefixes per request slot".into());
         }
-        if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "proposal_confidence") {
-            if buffer.dtype != Dtype::Float32 || buffer.shape.len() != 3
-                || buffer.shape[0] != 2 || buffer.shape[1] != self.request_capacity()
-                || !(1..self.completion_token_capacity).contains(&buffer.shape[2]) {
-                return Err("proposal confidence requires two float32 frames indexed by request slot and draft prefix".into());
-            }
+        if let Some(&buffer) = buffers_by_name.get("proposal_confidence")
+            && (buffer.dtype != Dtype::Float32
+                || buffer.shape.len() != 3
+                || buffer.shape[0] != 2
+                || buffer.shape[1] != self.request_capacity()
+                || !(1..self.completion_token_capacity).contains(&buffer.shape[2]))
+        {
+            return Err("proposal confidence requires two float32 frames indexed by request slot and draft prefix".into());
         }
-        if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps") {
-            if buffer.dtype != Dtype::Int64 || buffer.shape.len() != 2 || buffer.shape[0] != 2
-                || buffer.shape[1] == 0 || buffer.shape[1] % 3 != 0
+        if let Some(&buffer) = buffers_by_name.get("readiness_timestamps")
+            && (buffer.dtype != Dtype::Int64
+                || buffer.shape.len() != 2
+                || buffer.shape[0] != 2
+                || buffer.shape[1] == 0
+                || buffer.shape[1] % 3 != 0
                 || buffer.shape[1] / 3 > super::MAX_READINESS_INTERVALS
-                || buffer.strides != [buffer.shape[1], 1] {
-                return Err("readiness timestamps require two contiguous int64 frames of three timestamps per interval".into());
-            }
+                || buffer.strides != [buffer.shape[1], 1])
+        {
+            return Err("readiness timestamps require two contiguous int64 frames of three timestamps per interval".into());
         }
-        self.validate_tuning()?;
+        self.validate_tuning(&buffers_by_name)?;
+        let logprob_token_id_capacity = buffers_by_name
+            .get("logprob_token_ids")
+            .map_or(0, |b| b.shape[1]);
         let mut names = HashSet::new();
         let mut host_spans = HashMap::<&str, (usize, usize)>::new();
         for graph in &self.graphs {
@@ -846,7 +864,7 @@ impl ExecutionManifest {
                 return Err("draft depth and target rows require a speculative operation".into());
             }
             if graph.confidence_width > 0 {
-                let confidence = self.buffer("proposal_confidence")?;
+                let confidence = lookup_buffer("proposal_confidence")?;
                 if graph.kind != GraphKind::Speculative
                     || graph.confidence_width != graph.draft_tokens
                     || confidence.dtype != Dtype::Float32
@@ -912,7 +930,7 @@ impl ExecutionManifest {
                         format!("duplicate or output-only input binding in {}", graph.name),
                     ));
                 }
-                let buffer = self.buffer(&binding.buffer_name)?;
+                let buffer = lookup_buffer(&binding.buffer_name)?;
                 let end = binding
                     .host_offset
                     .checked_add(binding.nbytes)
@@ -929,13 +947,13 @@ impl ExecutionManifest {
                     ));
                 }
                 let span = (binding.host_offset, end);
-                if let Some(previous) = host_spans.insert(&binding.buffer_name, span) {
-                    if previous != span {
-                        return Err(Error::execution(
-                            ExecutionError::Manifest,
-                            "one buffer has different host offsets across graphs",
-                        ));
-                    }
+                if let Some(previous) = host_spans.insert(&binding.buffer_name, span)
+                    && previous != span
+                {
+                    return Err(Error::execution(
+                        ExecutionError::Manifest,
+                        "one buffer has different host offsets across graphs",
+                    ));
                 }
             }
             if bound.contains("prompt_target_tokens") != (graph.kind == GraphKind::ScoredPrefill) {
@@ -948,7 +966,7 @@ impl ExecutionManifest {
                         "sampling graphs require the generation logprob reporting flag",
                     ));
                 }
-                if self.logprob_token_id_capacity() != 0
+                if logprob_token_id_capacity != 0
                     && (!bound.contains("logprob_token_ids")
                         || !bound.contains("logprob_token_id_counts"))
                 {
@@ -965,7 +983,7 @@ impl ExecutionManifest {
                 ));
             }
             if graph.kind == GraphKind::Mixed {
-                let row = self.buffer("prefill_row")?;
+                let row = lookup_buffer("prefill_row")?;
                 if row.dtype != Dtype::Int32 || row.shape != [1] || !bound.contains("prefill_row") {
                     return Err(Error::execution(
                         ExecutionError::Manifest,

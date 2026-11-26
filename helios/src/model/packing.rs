@@ -6,6 +6,8 @@
 
 //! Resolve prepared value bindings once and pack bounded host uploads for each submission.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::{
     Result,
     execution::{Dtype, ExecutionManifest, GraphKind, REQUEST_LANES, Upload},
@@ -15,6 +17,16 @@ use crate::{
         inputs::{UploadBatch, append_pages},
     },
 };
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct GraphShapeKey {
+    kind: GraphKind,
+    drafts: usize,
+    batch: usize,
+    tokens: usize,
+    packed_tokens: usize,
+    prefill: usize,
+}
 
 struct BoundInput {
     binding: ValueBinding,
@@ -26,26 +38,23 @@ struct BoundInput {
 }
 
 struct BoundGraph {
-    drafts: usize,
     semantics: GraphContract,
     inputs: Vec<BoundInput>,
-    kind: GraphKind,
-    batch: usize,
-    tokens: usize,
-    packed_tokens: usize,
-    prefill: usize,
 }
 
 pub struct BoundContract {
     graphs: Vec<BoundGraph>,
+    by_shape: HashMap<GraphShapeKey, usize>,
+    #[cfg_attr(not(feature = "images"), allow(dead_code))]
+    vision_by_tokens: HashMap<usize, usize>,
 }
 
 pub struct Inputs {
     contract: BoundContract,
     staging: UploadBatch,
     pages: Vec<[(u64, usize); REQUEST_LANES]>,
-    /// Grammar-mask byte ranges (buffer, offset, length) that already hold an unconstrained mask.
-    unconstrained_masks: Vec<(String, usize, usize)>,
+    /// Grammar-mask `(offset, length)` byte ranges per buffer that already hold an unconstrained mask.
+    unconstrained_masks: HashMap<String, HashSet<(usize, usize)>>,
     integers: Vec<i64>,
     values: Vec<i64>,
 }
@@ -64,11 +73,36 @@ impl Inputs {
 
     pub fn new(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<Self> {
         config.contract.validate(manifest)?;
+        let buffers_by_name: HashMap<&str, &crate::execution::BufferDescriptor> = manifest
+            .buffers
+            .iter()
+            .map(|buffer| (buffer.name.as_str(), buffer))
+            .collect();
+        let page_views: HashMap<&str, usize> = config
+            .contract
+            .cache
+            .page_tables
+            .iter()
+            .enumerate()
+            .map(|(index, view)| (view.buffer.as_str(), index))
+            .collect();
+        let contracts_by_name: HashMap<&str, &GraphContract> = config
+            .contract
+            .graphs
+            .iter()
+            .map(|graph| (graph.graph.as_str(), graph))
+            .collect();
+        let mut by_shape = HashMap::with_capacity(manifest.graphs.len());
+        let mut vision_by_tokens = HashMap::new();
         let graphs = manifest
             .graphs
             .iter()
-            .map(|graph| {
-                let semantics = config.contract.graph(&graph.name)?;
+            .enumerate()
+            .map(|(index, graph)| {
+                let semantics = contracts_by_name
+                    .get(graph.name.as_str())
+                    .copied()
+                    .ok_or_else(|| format!("unknown graph contract {}", graph.name))?;
                 if semantics
                     .draft_cursor
                     .as_ref()
@@ -80,7 +114,15 @@ impl Inputs {
                     .inputs
                     .iter()
                     .map(|binding| {
-                        let buffer = manifest.buffer(&binding.buffer)?;
+                        let buffer = buffers_by_name
+                            .get(binding.buffer.as_str())
+                            .copied()
+                            .ok_or_else(|| {
+                                crate::Error::execution(
+                                    crate::ExecutionError::Manifest,
+                                    format!("unknown buffer {:?}", binding.buffer),
+                                )
+                            })?;
                         let elements = buffer.nbytes / buffer.dtype.size();
                         #[cfg(feature = "images")]
                         if binding.source == ValueSource::ImageTensor {
@@ -104,12 +146,7 @@ impl Inputs {
                             InputIndexing::Scalar => elements,
                             _ => buffer.shape.get(1..).unwrap_or(&[]).iter().product(),
                         };
-                        let page_view = config
-                            .contract
-                            .cache
-                            .page_tables
-                            .iter()
-                            .position(|v| v.buffer == binding.buffer);
+                        let page_view = page_views.get(binding.buffer.as_str()).copied();
                         if binding.source == ValueSource::PageTable && page_view.is_none() {
                             return Err("page-table input lacks a declared view".into());
                         }
@@ -245,15 +282,22 @@ impl Inputs {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
+                by_shape
+                    .entry(GraphShapeKey {
+                        kind: graph.kind,
+                        drafts: graph.draft_tokens,
+                        batch: graph.batch_capacity,
+                        tokens: graph.token_capacity,
+                        packed_tokens: graph.packed_token_capacity,
+                        prefill: graph.prefill_capacity,
+                    })
+                    .or_insert(index);
+                if graph.kind == GraphKind::Vision {
+                    vision_by_tokens.entry(graph.token_capacity).or_insert(index);
+                }
                 Ok(BoundGraph {
                     semantics: semantics.clone(),
                     inputs,
-                    kind: graph.kind,
-                    drafts: graph.draft_tokens,
-                    batch: graph.batch_capacity,
-                    tokens: graph.token_capacity,
-                    packed_tokens: graph.packed_token_capacity,
-                    prefill: graph.prefill_capacity,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -265,10 +309,14 @@ impl Inputs {
             .max()
             .unwrap_or(0);
         Ok(Self {
-            contract: BoundContract { graphs },
+            contract: BoundContract {
+                graphs,
+                by_shape,
+                vision_by_tokens,
+            },
             staging: UploadBatch::default(),
             pages: vec![[(0, 0); REQUEST_LANES]; config.contract.cache.page_tables.len()],
-            unconstrained_masks: Vec::new(),
+            unconstrained_masks: HashMap::new(),
             integers: Vec::with_capacity(maximum),
             values: Vec::with_capacity(maximum),
         })
@@ -278,21 +326,26 @@ impl Inputs {
         self.staging.uploads()
     }
 
+    fn graph_for_step(&self, step: &crate::scheduler::ScheduledStep) -> Option<&BoundGraph> {
+        let key = GraphShapeKey {
+            kind: step.kind,
+            drafts: step.draft_tokens,
+            batch: step.batch_capacity,
+            tokens: step.token_capacity,
+            packed_tokens: step.packed_token_capacity,
+            prefill: step.prefill_capacity(),
+        };
+        self.contract
+            .by_shape
+            .get(&key)
+            .map(|&index| &self.contract.graphs[index])
+    }
+
     pub fn completion_contract(
         &self,
         step: &crate::scheduler::ScheduledStep,
     ) -> Result<&GraphContract> {
-        self.contract
-            .graphs
-            .iter()
-            .find(|g| {
-                g.kind == step.kind
-                    && g.drafts == step.draft_tokens
-                    && g.batch == step.batch_capacity
-                    && g.tokens == step.token_capacity
-                    && g.packed_tokens == step.packed_token_capacity
-                    && g.prefill == step.prefill_capacity()
-            })
+        self.graph_for_step(step)
             .map(|g| &g.semantics)
             .ok_or_else(|| "completion has no prepared graph contract".into())
     }
@@ -310,9 +363,9 @@ impl Inputs {
     ) -> Result<()> {
         let graph = self
             .contract
-            .graphs
-            .iter()
-            .find(|g| g.kind == GraphKind::Vision && g.tokens == step.token_capacity)
+            .vision_by_tokens
+            .get(&step.token_capacity)
+            .map(|&index| &self.contract.graphs[index])
             .ok_or("vision submission lacks a prepared packing plan")?;
         let tensors = crate::frontend::images::packing::prepare(
             config,
@@ -326,7 +379,7 @@ impl Inputs {
         // Only retain cached bytes while this graph treats the same registered
         // buffer as a read-only mask input. Other bindings, graph state writes,
         // and graphs without that input may replace its contents.
-        self.unconstrained_masks.retain(|(name, _, _)|
+        self.unconstrained_masks.retain(|name, _|
             graph.inputs.iter().any(|input| input.cache_mask && input.binding.buffer == *name));
         for input in &graph.inputs {
             match input.binding.source {
@@ -372,24 +425,24 @@ impl Inputs {
     }
 
     fn pack_step(&mut self, frame: &InputStep<'_>) -> Result<()> {
-        let graph = self
+        let graph_index = *self
             .contract
-            .graphs
-            .iter()
-            .find(|g| {
-                g.kind == frame.step.kind
-                    && g.drafts == frame.step.draft_tokens
-                    && g.batch == frame.step.batch_capacity
-                    && g.tokens == frame.step.token_capacity
-                    && g.packed_tokens == frame.step.packed_token_capacity
-                    && g.prefill == frame.step.prefill_capacity()
+            .by_shape
+            .get(&GraphShapeKey {
+                kind: frame.step.kind,
+                drafts: frame.step.draft_tokens,
+                batch: frame.step.batch_capacity,
+                tokens: frame.step.token_capacity,
+                packed_tokens: frame.step.packed_token_capacity,
+                prefill: frame.step.prefill_capacity(),
             })
             .ok_or("submission has no resolved packing plan")?;
+        let graph = &self.contract.graphs[graph_index];
         self.staging.clear();
         // Only retain cached bytes while this graph treats the same registered
         // buffer as a read-only mask input. Other bindings, graph state writes,
         // and graphs without that input may replace its contents.
-        self.unconstrained_masks.retain(|(name, _, _)|
+        self.unconstrained_masks.retain(|name, _|
             graph.inputs.iter().any(|input| input.cache_mask && input.binding.buffer == *name));
         let mut history_proposals: [Option<(Vec<i64>, usize)>; REQUEST_LANES] = std::array::from_fn(|_| None);
         if frame.config.history_drafts
@@ -513,15 +566,18 @@ impl Inputs {
                     }
                     if let Some(mask) = &admission.grammar_mask {
                         // A constrained mask may overlap any unconstrained range of this buffer.
-                        self.unconstrained_masks.retain(|(name, _, _)| *name != binding.buffer);
+                        self.unconstrained_masks.remove(&binding.buffer);
                         self.staging.i32(
                             &binding.buffer,
                             destination * 4,
                             mask.iter().copied(),
                         );
-                    } else if !input.cache_mask || !self.unconstrained_masks.iter().any(|(name, offset, bytes)| {
-                        *name == binding.buffer && *offset == destination * 4 && *bytes == count * 4
-                    }) {
+                    } else if !input.cache_mask
+                        || !self
+                            .unconstrained_masks
+                            .get(&binding.buffer)
+                            .is_some_and(|spans| spans.contains(&(destination * 4, count * 4)))
+                    {
                         // Cache only rows whose graph contract preserves the uploaded mask.
                         self.staging.put(
                             &binding.buffer,
@@ -529,7 +585,10 @@ impl Inputs {
                             std::iter::repeat_n(0xff, count * 4),
                         );
                         if input.cache_mask {
-                            self.unconstrained_masks.push((binding.buffer.clone(), destination * 4, count * 4));
+                            self.unconstrained_masks
+                                .entry(binding.buffer.clone())
+                                .or_default()
+                                .insert((destination * 4, count * 4));
                         }
                     }
                     continue;
