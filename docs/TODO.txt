@@ -17,16 +17,6 @@
     legacy review still requires the files that VerifiedCore::open reads.
     Verify a legacy acquisition with an unknown key and missing companions.
 
-[ ] Report rebuild_weights for payload cores in flare inspect --json.
-    Payload inspection reports the selected deployment's rebuild manifest but
-    leaves each rank's rebuild_weights unset, so the JSON reports null. Remove
-    when payload and logical-resource cores report the same per-rank counts
-    for one rebuild manifest.
-
-[ ] Preflight file-descriptor capacity before TP core assembly opens every
-    payload file and cache lease. Report the required limit before partially
-    assembling ranks; see heliopause/src/export/core.rs and model-preparation.md.
-
 [ ] Prevent healthy TP forward compilation from exhausting the two-hour Gloo
     timeout in ForwardCache._prepare_ranks when idle ranks gather outcomes.
     Preserve compiler failure and dead-peer detection while waiting for work.
@@ -74,14 +64,6 @@
 [ ] Orbit: mDNS discovery, the fabric check with a ring-order proposal,
     preparation through agents (PREPARE, `flare orbit prepare`), and
     reconciliation (`flare orbit apply`). See orbit-proposals.md.
-
-[ ] Restore preparation/serving RoCE proxy parity once FlashInfer main includes
-    the sequence-limit guard and protocol verification additions. The pinned
-    FlashInfer proxy (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c)
-    declares ABI 11; helios/native/roce_proxy.c implements ABI 10 and
-    helios/src/execution/roce.rs loads only cores recording ABI 9 or 10.
-    Confirm with a multi-host core prepared from the pin whether serving
-    rejects it. See roce-ring.md#protocol-model-and-runtime-checks.
 
 [ ] Validate the unbuffered Windows core guard and parallel disk workers with
     complete DeepSeek Engram serving and with complete Qwen PLE serving;
@@ -134,23 +116,12 @@
 [ ] Reduce the host-bridge cost of the 512-thread selected barrier gather for
     512-byte rows at 1 MiB per rank: 20.1% above the best measured geometry.
 
-[ ] Repair the Debian package build. packaging/debian/Dockerfile builds
-    flare-cli/Cargo.toml without copying flare-cli/ into the build stage,
-    scripts/build_deb.sh omits flare-cli from its uncommitted-change check, and
-    packaging/debian/Dockerfile.dockerignore admits only
-    helios/licenses/PyTorch.txt although packaging/debian/package.sh installs
-    helios/licenses/*.txt. Close when scripts/build_deb.sh produces a package
-    that contains every license file.
+[ ] Run scripts/build_deb.sh in Docker and confirm the produced Debian package
+    contains every license file installed by packaging/debian/package.sh.
 
-[ ] Confirm and repair `flare orbit run ORG/NAME`. The agent's DOWNLOAD reply
-    names the cache entry directory (download in flare-cli/src/orbit/agent.rs),
-    the controller passes that path to STAT (resolve_core_from in
-    flare-cli/src/orbit/controller.rs), and STAT accepts only a regular file.
-    Close when a repository launch reaches rank start in a test.
-
-[ ] Replace "package" with "core" in Ignition help text: the `--mtp-only`
-    description in ignition/cli/__init__.py and ignition/cli/help.py reads
-    "package requires speculation at runtime".
+[ ] Add an Orbit controller test confirming `flare orbit run ORG/NAME` reaches
+    rank start after agent DOWNLOAD and STAT (agent download resolves the
+    regular primary core file in flare-cli/src/orbit/agent.rs).
 
 [ ] Reduce export memory with deferred graph executables and packed sparse
     initializers. Preflight aggregate metadata bounds before payload publication.
@@ -229,20 +200,9 @@
     accept restore-only pool stores; live multi-host restore serving remains
     untested on a physical cluster).
 
-[ ] Decide whether durable Selene manager records are isolated by pool name. A
-    manager started with a different --name on the same --root recovers the
-    records under its own name (selene-manager/src/disk.rs). Close when the
-    name is bound into the stored scope with a recovery test, or the behavior
-    is specified as intended.
-
 [ ] Log each Selene manager quarantine event once, as PROTOCOL.md section 7.4
     specifies; the manager logs only a failed RDMA queue-pair teardown
     (selene-manager/src/data/channel.rs).
-
-[ ] Cover shared-memory rank agents in the Selene manager restart hold. A rank
-    agent is not written to the holders file (selene-manager/src/pool/ranks.rs),
-    so a restarted manager does not hold reused regions for an agent that
-    outlives rank zero. See PROTOCOL.md section 8.6.
 
 [ ] Add a two-host data-channel procedure over TCP and TLS, with pass
     conditions, to selene-manager/docs/qualification.md; the suites in
