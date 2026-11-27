@@ -725,6 +725,67 @@ impl Core {
                 transfer: key.2,
             });
             self.puts.remove(&key);
+        } else {
+            self.note_put_quarantines(key);
+        }
+    }
+
+    /// Log each quarantined party on `key` at most once (PROTOCOL.md section 7.4).
+    pub(super) fn note_put_quarantines(&mut self, key: PutKey) {
+        let Some(rec) = self.puts.get(&key) else {
+            return;
+        };
+        let finished = rec.phase == PutPhase::Finished;
+        let bytes: u64 = rec.windows.values().map(|e| e.capacity() as u64).sum();
+        let mut to_log: Vec<(usize, String)> = Vec::new();
+        for (idx, p) in rec.parties.iter().enumerate() {
+            if p.quarantine_logged || !p.memory {
+                continue;
+            }
+            let reason = match p.owner {
+                Owner::Proc(proc) if self.proc_exited_flag(&proc) => None,
+                Owner::Proc(_) if p.state == Party::Quarantined => {
+                    Some("party attested QUARANTINED")
+                }
+                Owner::Proc(proc)
+                    if finished
+                        && p.state == Party::Pending
+                        && !self.process_connected(proc) =>
+                {
+                    Some("process disconnected with unfenced windows")
+                }
+                Owner::Leg(_) if finished && p.state == Party::Pending => {
+                    Some("data-channel handler did not exit after stop")
+                }
+                _ => None,
+            };
+            if let Some(why) = reason {
+                let owner = match p.owner {
+                    Owner::Proc(_) => "process".to_string(),
+                    Owner::Leg(transfer) => format!("data-channel transfer {transfer}"),
+                    Owner::Store => "store".to_string(),
+                };
+                to_log.push((
+                    idx,
+                    format!(
+                        "quarantined put {} ({owner}): {why} ({bytes} bytes held)",
+                        key.2
+                    ),
+                ));
+            }
+        }
+        if to_log.is_empty() {
+            return;
+        }
+        if let Some(rec) = self.puts.get_mut(&key) {
+            for (idx, _) in &to_log {
+                if let Some(p) = rec.parties.get_mut(*idx) {
+                    p.quarantine_logged = true;
+                }
+            }
+        }
+        for (_, message) in to_log {
+            self.emit_quarantine_log(message);
         }
     }
 
@@ -778,6 +839,38 @@ impl Core {
         if self
             .puts
             .get(&key)
+            .is_some_and(|rec| rec.packed)
+        {
+            if !m.page_xxh3.is_empty() || m.has_row || !m.rank_sums.is_empty() {
+                return Err(Violation::new(
+                    "a packed put states no raw page or rank checksums",
+                ));
+            }
+            let empty = || flare_selene::shared::SliceSums {
+                pages: Vec::new(),
+                row: None,
+            };
+            let parts = self
+                .puts
+                .get(&key)
+                .map(|rec| {
+                    std::iter::once((0usize, empty()))
+                        .chain(
+                            rec.mp
+                                .peers
+                                .iter()
+                                .filter(|p| p.shared)
+                                .map(|p| (p.rank as usize, empty())),
+                        )
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.window_parts(ChanOwner::Put(key), m.index, parts, 0);
+            return Ok(());
+        }
+        if self
+            .puts
+            .get(&key)
             .is_some_and(|rec| rec.mp.layout.world() > 1)
         {
             // A multi-process writer states its ranks' slice checksums, not whole ones.
@@ -814,6 +907,9 @@ impl Core {
         let Some(rec) = self.puts.get_mut(&key) else {
             return;
         };
+        if rec.packed {
+            return self.put_window_filled(key, index, Vec::new(), None);
+        }
         let mp = &mut rec.mp;
         if mp.layout.world() == 1 {
             let whole = stated.into_iter().next().unwrap();
@@ -897,6 +993,9 @@ impl Core {
     pub(super) fn put_agent_fence(&mut self, key: PutKey, agent: ProcKey, state: Party) {
         if let Some(rec) = self.puts.get_mut(&key) {
             attest(&mut rec.parties, Owner::Proc(agent), state, false);
+        }
+        if state == Party::Quarantined {
+            self.note_put_quarantines(key);
         }
         self.puts_settle(key);
     }
@@ -1029,9 +1128,10 @@ impl Core {
             return Ok(());
         }
         // A multi-process writer's ranks cannot state whole-page checksums; the record keeps
-        // the ones the manager computed over the assembled windows.
+        // the ones the manager computed over the assembled windows. Packed v4 records carry
+        // their own unit CRCs and raw_xxh3 in the v4 directory instead.
         let mut metadata = m.metadata.clone();
-        if rec.mp.layout.world() > 1 {
+        if rec.mp.layout.world() > 1 && !rec.packed {
             let mp = &rec.mp;
             let header = Header::decode(&metadata).expect("validated above");
             let pages: Option<Vec<u64>> = (0..header.tail_pages as usize)
@@ -1116,6 +1216,8 @@ impl Core {
         );
         if party == Party::Drained {
             rec.phase = PutPhase::Finished;
+        } else if party == Party::Quarantined {
+            self.note_put_quarantines(key);
         }
         self.puts_settle(key);
     }
@@ -1474,6 +1576,7 @@ mod tests {
                     source: true,
                     memory: true,
                     state: Party::Quarantined,
+                    quarantine_logged: false,
                 }],
                 refused: false,
                 key: Key::default(),

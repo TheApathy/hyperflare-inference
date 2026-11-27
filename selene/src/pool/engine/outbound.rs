@@ -63,6 +63,7 @@ impl Outbound {
         self.jobs_outstanding += 1;
         self.host_filling.insert(spec.index);
         let scatter = ranks.filter(|_| slot.is_none()).map(|r| r.layout.clone());
+        let packed = spec.packed.clone();
         FillJob {
             owner,
             window: spec.index,
@@ -71,15 +72,24 @@ impl Outbound {
                 let dst = unsafe {
                     std::slice::from_raw_parts_mut(address as *mut u8, spec.length as usize)
                 };
-                match scatter {
-                    Some(layout) => {
+                match (packed, scatter) {
+                    (Some(manifest), Some(_)) => {
+                        let rank_bytes =
+                            crate::shared::packed::rank_window_bytes(&manifest, 0) as usize;
+                        let mut slice = vec![0u8; rank_bytes];
+                        let sums = work(&mut slice)?;
+                        crate::shared::packed::scatter_rank_units(&manifest, 0, dst, &slice)?;
+                        Ok(sums)
+                    }
+                    (Some(_), None) => work(dst),
+                    (None, Some(layout)) => {
                         let mut packed =
                             vec![0; layout.slice_bytes(0, spec.page_count, spec.row) as usize];
                         let sums = work(&mut packed)?;
                         layout.scatter(0, dst, spec.page_count, spec.row, &packed)?;
                         Ok(sums)
                     }
-                    None => work(dst),
+                    (None, None) => work(dst),
                 }
             }),
         }
@@ -145,6 +155,16 @@ impl Outbound {
             return Ok(None);
         }
         let mut rank_sums = Vec::new();
+        if spec.packed.is_some() {
+            self.peers.windows.remove(&spec.index);
+            return Ok(Some((
+                Checksums {
+                    pages: Vec::new(),
+                    row: None,
+                },
+                rank_sums,
+            )));
+        }
         if ranked {
             let peers = self.peers.windows.remove(&spec.index);
             for (rank, sums) in

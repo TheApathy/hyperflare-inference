@@ -142,6 +142,6 @@ ibv_devices                                    # rxe0 should appear
 | Remote instances fail to attach at startup | The address and firewall; whether the instance trusts the manager's CA (the host's CA bundle or its CA file), and the one-line error it logged at start; `Hello.encryption`. |
 | `DATA_CHANNEL` claims or puts refused | The manager has no network listener (`INVALID_CLAIM`, or `PutRefused{INVALID}` saying so). |
 | Claims expire with `NO_PROGRESS` | The instance cannot reach `--listen-data` (firewall, a published port that is not the bound one), or it does not read fast enough. |
-| Windows quarantined (`selene_pool_quarantined_bytes`) | A data handler did not exit after its transfer was stopped; the manager logs a line only when an RDMA teardown failed (`RDMA teardown failed; transfer quarantined`). They return if the exit is seen, else at restart. |
+| Windows quarantined (`selene_pool_quarantined_bytes`) | A party reported `QUARANTINED`, a local process disconnected with unfenced windows, or a data handler did not exit after its transfer was stopped (including RDMA teardown failure). Each quarantine event is logged once to stderr; windows return once exit or drain is observed, else at manager restart. |
 | TLS handshake failures | The certificate's SAN against the name clients dial; that the CA the clients hold signed the server certificate. |
 | `--rdma` refused | TLS options present, no `--listen`, a build without the `rdma` feature, a wildcard data listener, or no active RoCE v2 GID matching the data listener address. |

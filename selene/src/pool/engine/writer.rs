@@ -125,6 +125,7 @@ impl Engine {
         &mut self,
         id: u64,
         pages: u32,
+        packed: Option<wire::PackedOffer>,
         rank_channels: &[wire::RankChannel],
     ) -> std::result::Result<(), String> {
         let Some(put) = self.writer.puts.get(&id) else {
@@ -140,7 +141,7 @@ impl Engine {
             kind: wire::rank_fence::Kind::Put as i32,
             fence_id: id,
             records: vec![wire::Record {
-                packed: None,
+                packed,
                 key: Some(codec::key_to(put.key)),
                 first_page: 0,
                 pages,
@@ -403,23 +404,30 @@ impl Engine {
         }
         let put = self.writer.puts.get_mut(&id).expect("present");
         put.row = row;
+        let via_channel = put.via_channel;
         let mut coverage = Coverage::new(vec![ExpectedRecord {
             key: put.key,
             first_page: 0,
             pages: pages as u32,
             row: put.row,
         }]);
-        if put.packed_accepted
+        coverage.channel_rank = (via_channel && self.ranks.is_some()).then_some(0);
+        let peer_packed = if put.packed_accepted
             && let Some(layout) = final_header.packed
         {
+            let offer = layout.offer().clone();
             coverage.set_packed_layout(0, (*layout).clone());
-        }
+            Some(offer)
+        } else {
+            None
+        };
         let put = self.writer.puts.get_mut(&id).expect("present");
         put.coverage = Some(coverage);
         put.sums = vec![0; pages as usize];
         put.phase = Phase::Accepted;
         if self.ranks.is_some()
-            && let Err(why) = self.open_put_peers(id, pages as u32, &accept.rank_channels)
+            && let Err(why) =
+                self.open_put_peers(id, pages as u32, peer_packed, &accept.rank_channels)
         {
             return self.fail_put(id, Error::new(why));
         }

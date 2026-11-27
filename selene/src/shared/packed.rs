@@ -20,10 +20,7 @@ pub const MAX_RANKS: usize = 64;
 
 /// Whether a record tail with `pages`, optional `row`, and `ranks` fits within `MAX_UNITS`.
 pub(crate) fn fits_units(pages: usize, row: bool, ranks: usize) -> bool {
-    pages
-        .saturating_add(usize::from(row))
-        .saturating_mul(ranks)
-        <= MAX_UNITS
+    pages.saturating_add(usize::from(row)).saturating_mul(ranks) <= MAX_UNITS
 }
 
 pub fn raw_reader() -> CodecCaps {
@@ -59,7 +56,14 @@ pub fn permits<'a>(
 }
 
 pub fn permits_offer(caps: Option<&CodecCaps>, offer: &PackedOffer) -> bool {
-    permits(caps, offer.units.iter().filter(|u| u.representation != Representation::Literal as i32).map(|u| &u.profile))
+    permits(
+        caps,
+        offer
+            .units
+            .iter()
+            .filter(|u| u.representation != Representation::Literal as i32)
+            .map(|u| &u.profile),
+    )
 }
 
 pub fn permits_holding(caps: Option<&CodecCaps>, packed: bool, profiles: &[Vec<u8>]) -> bool {
@@ -95,6 +99,9 @@ pub struct Layout {
     // Index of the first unit of each page, then the first row unit.
     pages: Vec<usize>,
 }
+
+// PackedOffer holds only integer, byte, and nested integer fields (no floats).
+impl Eq for Layout {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Span {
@@ -175,7 +182,10 @@ impl Layout {
         let mut offsets = vec![0u64];
         let mut pages = Vec::new();
         let mut i = 0;
-        for (kind, index) in (first..end).map(|p| (Kind::Page, p)).chain(std::iter::once((Kind::Row, 0))) {
+        for (kind, index) in (first..end)
+            .map(|p| (Kind::Page, p))
+            .chain(std::iter::once((Kind::Row, 0)))
+        {
             pages.push(i);
             if kind == Kind::Row && i == offer.units.len() {
                 break;
@@ -196,11 +206,13 @@ impl Layout {
                 }
                 previous = Some(unit.stored_rank);
                 match Representation::try_from(unit.representation) {
-                    Ok(Representation::Literal) if unit.profile.is_empty()
-                        && unit.original_length == unit.stored_length
-                        && unit.stored_crc == 0
-                        && unit.original_crc == 0 => {}
-                    Ok(Representation::Packet) if unit.profile.len() == 32 && unit.raw_xxh3 == 0 => {}
+                    Ok(Representation::Literal)
+                        if unit.profile.is_empty()
+                            && unit.original_length == unit.stored_length
+                            && unit.stored_crc == 0
+                            && unit.original_crc == 0 => {}
+                    Ok(Representation::Packet)
+                        if unit.profile.len() == 32 && unit.raw_xxh3 == 0 => {}
                     _ => return Err(invalid("unknown unit representation or checksum domain")),
                 }
                 let mut last = None;
@@ -360,6 +372,178 @@ pub fn leg_units(
         .filter(move |(_, u)| rank.is_none_or(|r| r == u.stored_rank || u.replicas.contains(&r)))
 }
 
+/// Stored bytes belonging to `rank` inside a world-wide packed window.
+pub fn rank_window_bytes(window: &super::wire::PackedWindow, rank: u32) -> u64 {
+    leg_units(window, Some(rank))
+        .map(|(_, u)| u.stored_length)
+        .sum()
+}
+
+/// Scatter `rank`'s contiguous packed slice `src` into its unit offsets inside
+/// a shared world-wide packed window `dst`.
+pub fn scatter_rank_units(
+    window: &super::wire::PackedWindow,
+    rank: u32,
+    dst: &mut [u8],
+    src: &[u8],
+) -> Result<()> {
+    let mut cursor = 0usize;
+    for (at, unit) in leg_units(window, Some(rank)) {
+        let len = usize::try_from(unit.stored_length).map_err(|_| invalid("packed unit length"))?;
+        let at = usize::try_from(at).map_err(|_| invalid("packed unit offset"))?;
+        let from = src
+            .get(cursor..cursor + len)
+            .ok_or_else(|| invalid("packed rank slice is shorter than its manifest"))?;
+        let to = dst
+            .get_mut(at..at + len)
+            .ok_or_else(|| invalid("packed rank unit lies outside the shared window"))?;
+        to.copy_from_slice(from);
+        cursor += len;
+    }
+    if cursor != src.len() {
+        return Err(invalid("packed rank slice has trailing bytes"));
+    }
+    Ok(())
+}
+
+/// Build a single-rank all-literal `PackedOffer` from a raw v3 header and its
+/// persisted page checksums so mixed compressed/literal multi-host ranks can
+/// form a single world-wide v4 offer.
+pub fn literal_offer_from_raw(
+    header: &super::record::Header,
+    page_sums: &[u64],
+    row: bool,
+) -> Result<PackedOffer> {
+    if header.packed.is_some() || header.ranks.len() != 1 {
+        return Err(invalid("expected a single-rank raw header"));
+    }
+    if page_sums.len() != header.tail_pages as usize {
+        return Err(invalid(
+            "raw header checksum count disagrees with tail pages",
+        ));
+    }
+    let first_page = header
+        .parent
+        .map_or(0, |p| p.consumed_tokens / header.page_tokens);
+    let rank = &header.ranks[0];
+    let page_bytes = rank.page_record_bytes();
+    let row_bytes = rank.row_record_bytes();
+    let mut units = Vec::with_capacity(page_sums.len() + usize::from(row));
+    for (i, &sum) in page_sums.iter().enumerate() {
+        units.push(PackedUnit {
+            kind: Kind::Page as i32,
+            logical_index: first_page + i as u64,
+            stored_rank: 0,
+            representation: Representation::Literal as i32,
+            profile: Vec::new(),
+            original_length: page_bytes,
+            stored_length: page_bytes,
+            replicas: Vec::new(),
+            stored_crc: 0,
+            original_crc: 0,
+            raw_xxh3: sum,
+        });
+    }
+    if row {
+        units.push(PackedUnit {
+            kind: Kind::Row as i32,
+            logical_index: 0,
+            stored_rank: 0,
+            representation: Representation::Literal as i32,
+            profile: Vec::new(),
+            original_length: row_bytes,
+            stored_length: row_bytes,
+            replicas: Vec::new(),
+            stored_crc: 0,
+            original_crc: 0,
+            raw_xxh3: header.row_checksum,
+        });
+    }
+    Ok(PackedOffer { first_page, units })
+}
+
+/// Merge `world` single-rank offers (each describing its own rank as `stored_rank == 0`)
+/// into a canonical world-wide [`Layout`] covering ranks `0..world`.
+pub fn merge_rank_offers(
+    offers: &[PackedOffer],
+    ranks: &[RankSizes],
+    first_page: u64,
+    tail_pages: u32,
+    row: bool,
+) -> Result<Layout> {
+    let world = ranks.len();
+    if world == 0 || offers.len() != world {
+        return Err(invalid("packed rank offer count disagrees with world size"));
+    }
+    let end_page = first_page
+        .checked_add(u64::from(tail_pages))
+        .ok_or_else(|| invalid("packed page range overflow"))?;
+    let mut page_units: Vec<Vec<Option<&PackedUnit>>> =
+        vec![vec![None; world]; tail_pages as usize];
+    let mut row_units: Vec<Option<&PackedUnit>> = vec![None; world];
+    for (rank, offer) in offers.iter().enumerate() {
+        if offer.first_page != first_page {
+            return Err(invalid("rank packed offer has a different first page"));
+        }
+        for unit in &offer.units {
+            if unit.stored_rank != 0 || !unit.replicas.is_empty() {
+                return Err(invalid(
+                    "single-rank packed offer must store rank zero without replicas",
+                ));
+            }
+            match Kind::try_from(unit.kind) {
+                Ok(Kind::Page) => {
+                    if unit.logical_index < first_page || unit.logical_index >= end_page {
+                        return Err(invalid("rank packed offer page outside record range"));
+                    }
+                    let slot = &mut page_units[(unit.logical_index - first_page) as usize][rank];
+                    if slot.replace(unit).is_some() {
+                        return Err(invalid("duplicate page unit in rank packed offer"));
+                    }
+                }
+                Ok(Kind::Row) => {
+                    if unit.logical_index != 0 {
+                        return Err(invalid("invalid row logical index in rank packed offer"));
+                    }
+                    if row && row_units[rank].replace(unit).is_some() {
+                        return Err(invalid("duplicate row unit in rank packed offer"));
+                    }
+                }
+                Err(_) => return Err(invalid("unknown packed unit kind")),
+            }
+        }
+    }
+    let mut units = Vec::with_capacity(
+        (tail_pages as usize)
+            .saturating_add(usize::from(row))
+            .saturating_mul(world),
+    );
+    for page in page_units {
+        for (rank, unit) in page.into_iter().enumerate() {
+            let mut unit = unit
+                .ok_or_else(|| invalid("rank packed offer missing a page unit"))?
+                .clone();
+            unit.stored_rank = rank as u32;
+            units.push(unit);
+        }
+    }
+    if row {
+        for (rank, unit) in row_units.into_iter().enumerate() {
+            let mut unit = unit
+                .ok_or_else(|| invalid("rank packed offer missing a row unit"))?
+                .clone();
+            unit.stored_rank = rank as u32;
+            units.push(unit);
+        }
+    }
+    Layout::new(
+        PackedOffer { first_page, units },
+        ranks,
+        first_page,
+        tail_pages,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +641,95 @@ mod tests {
         assert!(fits_units(4096, false, 4));
         assert!(!fits_units(4097, false, 4));
         assert!(!fits_units(usize::MAX, true, 4));
+    }
+
+    #[test]
+    fn merge_rank_offers_combines_compressed_and_literal_ranks_and_scatters_windows() {
+        let rank_geom = crate::testing::geometry(64, &[("kv", 4096)], 4096);
+        let mut raw_header = crate::record::Header::new(
+            std::slice::from_ref(&rank_geom),
+            [1; 32],
+            [2; 16],
+            crate::PrefixKey {
+                consumed_tokens: 128,
+                digest: [9; 16],
+            },
+            None,
+            [0; 16],
+            2,
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let r1_p0 = vec![0x11u8; 4096];
+        let r1_p1 = vec![0x22u8; 4096];
+        let r1_row = vec![0x33u8; 4096];
+        raw_header.row_checksum = crate::record::checksum(&r1_row);
+        let r1_offer = literal_offer_from_raw(
+            &raw_header,
+            &[
+                crate::record::checksum(&r1_p0),
+                crate::record::checksum(&r1_p1),
+            ],
+            true,
+        )
+        .unwrap();
+
+        let r0_p0 = b"r0-page0-pkt";
+        let r0_p1 = b"r0-p1";
+        let r0_row = b"r0-row-pkt";
+        let mut u_p0 = unit(0, r0_p0, vec![]);
+        u_p0.logical_index = 0;
+        let mut u_p1 = unit(0, r0_p1, vec![]);
+        u_p1.logical_index = 1;
+        let mut u_row = unit(0, r0_row, vec![]);
+        u_row.kind = Kind::Row as i32;
+        u_row.logical_index = 0;
+        let r0_offer = PackedOffer {
+            first_page: 0,
+            units: vec![u_p0, u_p1, u_row],
+        };
+
+        let world_ranks = vec![raw_header.ranks[0].clone(); 2];
+        let merged = merge_rank_offers(
+            &[r0_offer.clone(), r1_offer.clone()],
+            &world_ranks,
+            0,
+            2,
+            true,
+        )
+        .unwrap();
+        assert_eq!(merged.page_count(), 2);
+        assert_eq!(merged.row_bytes(), r0_row.len() as u64 + 4096);
+        let window = PackedWindow {
+            units: merged.units(0, 2, true).unwrap().to_vec(),
+        };
+        assert_eq!(
+            rank_window_bytes(&window, 0),
+            (r0_p0.len() + r0_p1.len() + r0_row.len()) as u64
+        );
+        assert_eq!(rank_window_bytes(&window, 1), 3 * 4096);
+
+        let mut shared = vec![0u8; merged.physical_bytes() as usize];
+        let r0_slice = [r0_p0.as_slice(), r0_p1.as_slice(), r0_row.as_slice()].concat();
+        let r1_slice = [r1_p0.as_slice(), r1_p1.as_slice(), r1_row.as_slice()].concat();
+        scatter_rank_units(&window, 0, &mut shared, &r0_slice).unwrap();
+        scatter_rank_units(&window, 1, &mut shared, &r1_slice).unwrap();
+        verify_units(&window.units, &shared).unwrap();
+
+        // Merging with row=false drops row units cleanly.
+        let no_row = merge_rank_offers(
+            &[r0_offer.clone(), r1_offer.clone()],
+            &world_ranks,
+            0,
+            2,
+            false,
+        )
+        .unwrap();
+        assert_eq!(no_row.row_bytes(), 0);
+
+        // Nonzero stored_rank in a single-rank offer is rejected.
+        let mut bad = r0_offer;
+        bad.units[0].stored_rank = 1;
+        assert!(merge_rank_offers(&[bad, r1_offer], &world_ranks, 0, 2, true).is_err());
     }
 }

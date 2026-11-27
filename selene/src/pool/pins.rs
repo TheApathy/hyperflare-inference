@@ -246,14 +246,31 @@ const MIN_AHEAD_BYTES: u64 = 2 * 4 << 20;
 pub(crate) struct FileSpan {
     pub path: PathBuf,
     pub header: Header,
+    /// World-wide packed v4 layout across all ranks of a multi-host sharded record.
+    pub world_packed: Option<Arc<crate::shared::packed::Layout>>,
     open: Option<OpenSpan>,
 }
 
 impl FileSpan {
+    #[cfg(test)]
     pub(crate) fn new(path: PathBuf, header: Header) -> Self {
         Self {
             path,
             header,
+            world_packed: None,
+            open: None,
+        }
+    }
+
+    pub(crate) fn with_world_packed(
+        path: PathBuf,
+        header: Header,
+        world_packed: Option<Arc<crate::shared::packed::Layout>>,
+    ) -> Self {
+        Self {
+            path,
+            header,
+            world_packed,
             open: None,
         }
     }
@@ -294,12 +311,13 @@ impl HostPin for FilePin {
     fn is_packed(&self, record: usize) -> bool {
         self.spans
             .get(record)
-            .is_some_and(|s| s.header.packed.is_some())
+            .is_some_and(|s| s.world_packed.is_some() || s.header.packed.is_some())
     }
 
     fn packed_offer_for(&self, record: usize) -> Option<crate::shared::wire::PackedOffer> {
         let rec = self.chain.records.get(record)?;
-        let layout = self.spans.get(record)?.header.packed.as_ref()?;
+        let span = self.spans.get(record)?;
+        let layout = span.world_packed.as_ref().or(span.header.packed.as_ref())?;
         let start = layout.offer().first_page + u64::from(rec.first_page);
         let units = layout
             .units(rec.first_page as usize, rec.pages as usize, rec.row)?
@@ -315,12 +333,6 @@ impl HostPin for FilePin {
             .spans
             .get_mut(window.record as usize)
             .ok_or_else(|| Error::new("window names no record"))?;
-        let layout = span
-            .header
-            .packed
-            .as_ref()
-            .ok_or_else(|| Error::new("record file is not stored packed"))?
-            .clone();
         let path = span.path.clone();
         let io = |what: &str, e: std::io::Error| {
             Error::caused_by(format!("{what} {}", path.display()), e)
@@ -329,34 +341,79 @@ impl HostPin for FilePin {
             let file = File::open(&span.path).map_err(|e| io("cannot open", e))?;
             span.open = Some(OpenSpan { file, ahead: None });
         }
-        let open = span.open.as_mut().expect("opened");
-        let first = window.first_page as usize;
-        let count = window.page_count as usize;
-        if first.checked_add(count).is_none_or(|end| end > layout.page_count()) {
-            return Err(Error::new("packed put window exceeds record pages"));
-        }
-        let start_rel = if count == 0 && window.row {
-            layout.page_offset(layout.page_count())
+        let len = if let Some(layout) = span.header.packed.clone() {
+            let open = span.open.as_mut().expect("opened");
+            let first = window.first_page as usize;
+            let count = window.page_count as usize;
+            if first
+                .checked_add(count)
+                .is_none_or(|end| end > layout.page_count())
+            {
+                return Err(Error::new("packed put window exceeds record pages"));
+            }
+            let start_rel = if count == 0 && window.row {
+                layout.page_offset(layout.page_count())
+            } else {
+                layout.page_offset(first)
+            };
+            let end_rel = if window.row {
+                layout.physical_bytes()
+            } else {
+                layout.page_offset(first + count)
+            };
+            let len = end_rel
+                .checked_sub(start_rel)
+                .ok_or_else(|| Error::new("packed put window range is inverted"))?
+                as usize;
+            let out = dst
+                .get_mut(..len)
+                .ok_or_else(|| Error::new("packed put window buffer too small"))?;
+            if len > 0 {
+                open.file
+                    .read_exact_at(out, span.header.page_segment + start_rel)
+                    .map_err(|e| io("cannot read packed window of", e))?;
+            }
+            len
+        } else if span.world_packed.is_some() {
+            // Rank 0's local shard fell back to all-literal v3 while a peer rank
+            // compressed as v4 packets; serve rank 0's raw literal bytes.
+            let open = span.open.as_mut().expect("opened");
+            let first = u64::from(window.first_page);
+            let count = window.page_count as usize;
+            if window
+                .first_page
+                .checked_add(window.page_count)
+                .is_none_or(|end| end > span.header.tail_pages)
+            {
+                return Err(Error::new("packed put window exceeds record pages"));
+            }
+            let page_len = count * self.page_bytes as usize;
+            let row_len = if window.row {
+                self.row_bytes as usize
+            } else {
+                0
+            };
+            let len = page_len + row_len;
+            let out = dst
+                .get_mut(..len)
+                .ok_or_else(|| Error::new("packed put window buffer too small"))?;
+            if page_len > 0 {
+                open.file
+                    .read_exact_at(
+                        &mut out[..page_len],
+                        span.header.page_segment + first * self.page_bytes,
+                    )
+                    .map_err(|e| io("cannot read literal packed pages of", e))?;
+            }
+            if window.row {
+                open.file
+                    .read_exact_at(&mut out[page_len..], span.header.row_segment)
+                    .map_err(|e| io("cannot read literal packed row of", e))?;
+            }
+            len
         } else {
-            layout.page_offset(first)
+            return Err(Error::new("record file is not stored packed"));
         };
-        let end_rel = if window.row {
-            layout.physical_bytes()
-        } else {
-            layout.page_offset(first + count)
-        };
-        let len = end_rel
-            .checked_sub(start_rel)
-            .ok_or_else(|| Error::new("packed put window range is inverted"))?
-            as usize;
-        let out = dst
-            .get_mut(..len)
-            .ok_or_else(|| Error::new("packed put window buffer too small"))?;
-        if len > 0 {
-            open.file
-                .read_exact_at(out, span.header.page_segment + start_rel)
-                .map_err(|e| io("cannot read packed window of", e))?;
-        }
         let (record_first, record_pages, record_has_row) = {
             let record = &self.chain.records[window.record as usize];
             (record.first_page, record.pages, record.row)

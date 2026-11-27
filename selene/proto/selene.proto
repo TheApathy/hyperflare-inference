@@ -32,15 +32,16 @@
 //                        incarnation. A new Session by the same instance_id
 //                        supersedes the old one (newer incarnation wins).
 //   instance_id          16 bytes, STABLE across restarts. Derived by
-//                        `selene::pool::instance_id` (crate `flare-selene`,
-//                        src/pool/identity.rs), which documents the byte layout:
-//                        BLAKE2b-128 over "selene-instance-v2", then the pool name,
-//                        the model identity, the layout fingerprint and the GPU
-//                        UUIDs in ascending byte order, each preceded by its
-//                        length as a little-endian u32. Instances on one host use
-//                        disjoint GPUs, so it is unique per host; a restarted
-//                        instance gets the same id. The manager only compares it;
-//                        it never recomputes it.
+//                        `flare_selene::shared::identity::instance_id` (crate
+//                        `flare-selene`, selene/src/shared/identity.rs), which
+//                        documents the byte layout: BLAKE2b-128 over
+//                        "selene-instance-v2", then the pool name, the model
+//                        identity, the layout fingerprint and the GPU UUIDs in
+//                        ascending byte order, each preceded by its length as a
+//                        little-endian u32. Instances on one host use disjoint
+//                        GPUs, so it is unique per host; a restarted instance
+//                        gets the same id. The manager only compares it; it
+//                        never recomputes it.
 //   process_nonce        16 random bytes chosen by the client at process start
 //                        (OpenSession.process_nonce). Tells two processes with
 //                        one instance_id apart; unchanged across a reconnect of
@@ -114,12 +115,13 @@ message Scope {
   // interpret layouts.
   Geometry geometry = 4;
 }
-// scope_id is derived by `selene::pool::scope_id` (crate `flare-selene`,
-// src/pool/identity.rs), which documents the byte layout: BLAKE2b-256 over
-// "selene-scope-v2", the model identity, the layout fingerprint, the pool name as one
-// length byte then its bytes, and the canonical bytes of `geometry` (all integers
-// little-endian). The manager calls that function from the same crate and
-// SessionOpened echoes its value; the client must compare it with its own.
+// scope_id is derived by `flare_selene::shared::identity::scope_id` (crate
+// `flare-selene`, selene/src/shared/identity.rs), which documents the byte
+// layout: BLAKE2b-256 over "selene-scope-v2", the model identity, the layout
+// fingerprint, the pool name as one length byte then its bytes, and the
+// canonical bytes of `geometry` (all integers little-endian). The manager calls
+// that function from the same crate and SessionOpened echoes its value; the
+// client must compare it with its own.
 
 // Where a copy of a record lives, from the source's point of view.
 enum Tier {
@@ -355,9 +357,9 @@ message OpenSession {
   // whose instance_id already has a live session replaces it: the newer
   // incarnation wins and the older session is fenced (SessionClosing SUPERSEDED;
   // its claims fail, its windows stay quarantined until its process is confirmed
-  // exited, its pins are not attestable). The older session's entries are not
-  // offered from that moment and are replaced atomically when the newer session's
-  // snapshot installs.
+  // exited, its pins are not attestable). The older session's index entries are
+  // cleared immediately when superseded, and the newer session's resync chunks
+  // upsert entries live.
   bytes instance_id = 2;
   Scope scope = 4;
   // 16 random bytes, fresh per process, constant across reconnects of the same
@@ -865,8 +867,9 @@ message ExportRequest {
   // differs discards the request and answers PinAck{REFUSED, STALE_SOURCE}.
   uint64 session_incarnation = 10;
   // Bytes of retained staging the manager has reserved for this export (windows
-  // and row). Always set for a GPU-tier export. The source computes the actual
-  // size of the chain before pinning and refuses NO_WINDOWS if it exceeds this.
+  // and row). Always set for a GPU-tier export. After pinning the chain, the
+  // source checks its actual byte size against this reservation before sending
+  // PinAck, releasing the pin and refusing NO_WINDOWS if it exceeds this.
   // For host tiers 0 means the claim will stream.
   uint64 reserved_bytes = 11;
   // Set when the source has no shared memory with the manager (a TCP session):
@@ -888,9 +891,9 @@ enum PinResult {
 // The answer to an ExportRequest. PINNED means: the whole chain from
 // begin_tokens to the endpoint, and the endpoint row if wanted, is pinned in the
 // source and will stay until the source sends ExportEnd. REFUSED carries the
-// reason (NOT_FOUND, GENERATION_CHANGED, CHAIN_GAP, NO_HEADROOM, SOURCE_BUSY,
-// INVALID_CLAIM) and means nothing is pinned. Sent at most once per export_id;
-// duplicates are ignored.
+// reason (NOT_FOUND, CHAIN_GAP, NO_HEADROOM, NO_WINDOWS, SOURCE_BUSY,
+// INVALID_CLAIM, CANCELLED, or STALE_SOURCE) and means nothing is pinned. Sent
+// at most once per export_id; duplicates are ignored.
 message PinAck {
   uint64 export_id = 1;
   PinResult result = 2;
@@ -975,15 +978,16 @@ enum Reason {
   REASON_UNSPECIFIED = 0;
   PRESENT = 1;     // already stored and committed: a successful deduplication.
   INFLIGHT = 2;    // a put for the same key is running.
-  BUDGET = 3;      // out of write budget or full: the writer advances the record to the next tier now; no retry loop.
+  BUDGET = 3;      // out of write budget or full: temporary refusal; the writer backs off and retries once before dropping the record (or falling back to a leaf-only attempt for an ancestor).
   OVERSIZE = 4;    // can never fit; do not retry.
   INVALID = 6;
   QUEUE = 7;       // max_open_puts reached.
   IO = 8;          // a manager device error; the manager is unhealthy.
   PUT_NOT_READY = 9;
 }
-// BUDGET and "full" are the writer's cue to advance the record to the next
-// configured tier immediately, not to wait (PROTOCOL.md section 11).
+// BUDGET and INFLIGHT are temporary refusals: the cascade backs off and retries
+// the put once before dropping the leaf (or attempting the leaf alone when an
+// ancestor put is refused).
 
 enum CaptureRole {
   LEGACY = 0;

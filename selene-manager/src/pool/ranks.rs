@@ -244,6 +244,7 @@ impl Core {
         if !agent.drain_only {
             self.agent_gone(proc);
         }
+        self.note_proc_quarantines(proc);
         if let Some(entry) = self.procs.get_mut(&proc) {
             entry.idle_since = Some(Instant::now());
         }

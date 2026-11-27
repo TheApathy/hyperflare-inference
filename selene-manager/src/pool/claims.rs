@@ -56,6 +56,7 @@ pub struct Participant {
     pub source: bool,
     pub memory: bool,
     pub state: Party,
+    pub quarantine_logged: bool,
 }
 
 impl Participant {
@@ -117,6 +118,7 @@ pub fn participants(
                     } else {
                         Party::Drained
                     },
+                    quarantine_logged: false,
                 });
             }
         }
@@ -127,6 +129,7 @@ pub fn participants(
             source,
             memory: true,
             state: Party::Drained,
+            quarantine_logged: false,
         }));
     }
     parties.extend(legs.iter().map(|leg| Participant {
@@ -134,6 +137,7 @@ pub fn participants(
         source: leg.source,
         memory: true,
         state: Party::Pending,
+        quarantine_logged: false,
     }));
     parties
 }
@@ -366,7 +370,7 @@ impl Core {
             || self.agents.values().any(|a| a.proc() == process)
     }
 
-    fn proc_exited_flag(&self, key: &ProcKey) -> bool {
+    pub(super) fn proc_exited_flag(&self, key: &ProcKey) -> bool {
         self.procs.get(key).is_none_or(|proc| proc.exited)
     }
 
@@ -1398,7 +1402,7 @@ impl Core {
                             shape: shape_for(spec, layout, *rank as usize),
                             region,
                             offset: spec.offset,
-                            packed: spec.packed.is_some(),
+                            packed: spec.packed.clone(),
                         },
                     );
                 }
@@ -1451,18 +1455,22 @@ impl Core {
                 self.finish(key, v2::ClaimState::Failed, v2::ClaimReason::CopyError);
                 return Ok(());
             }
-            self.window_parts(
-                ChanOwner::Source(key),
-                m.index,
-                vec![(
-                    0,
-                    SliceSums {
-                        pages: Vec::new(),
-                        row: None,
-                    },
-                )],
-                0,
-            );
+            let empty = || SliceSums {
+                pages: Vec::new(),
+                row: None,
+            };
+            let parts = std::iter::once((0usize, empty()))
+                .chain(
+                    claim
+                        .mp
+                        .src
+                        .peers
+                        .iter()
+                        .filter(|p| p.shared)
+                        .map(|p| (p.rank as usize, empty())),
+                )
+                .collect();
+            self.window_parts(ChanOwner::Source(key), m.index, parts, 0);
             return Ok(());
         }
         if claim.mp.src.layout.world() > 1 && (!m.page_xxh3.is_empty() || m.rank_sums.is_empty()) {
@@ -1623,6 +1631,9 @@ impl Core {
                         party,
                         false,
                     );
+                    if party == Party::Quarantined {
+                        self.note_claim_quarantines(key);
+                    }
                     self.reclaim(key);
                 }
                 Ok(())
@@ -1662,6 +1673,12 @@ impl Core {
         }
         claim.export = ExportState::Ended;
         attest(&mut claim.parties, Owner::Proc(sender), party, false);
+        if party == Party::Quarantined {
+            self.note_claim_quarantines(key);
+        }
+        let Some(claim) = self.claims.get(&key) else {
+            return Ok(());
+        };
         if !claim.is_terminal() {
             let status =
                 v2::ExportEndStatus::try_from(m.status).unwrap_or(v2::ExportEndStatus::Unspecified);
@@ -1756,6 +1773,7 @@ impl Core {
                 source: true,
                 memory: false,
                 state: Party::Pending,
+                quarantine_logged: false,
             });
         }
         for (index, leg) in claim.legs.iter().enumerate() {
@@ -2045,6 +2063,116 @@ impl Core {
         if requester_ok && claim.manager.is_some() {
             self.store_release_transfer(key);
         }
+        self.note_claim_quarantines(key);
+    }
+
+    /// Log each quarantined party on `key` at most once (PROTOCOL.md section 7.4).
+    pub(super) fn note_claim_quarantines(&mut self, key: ClaimKey) {
+        let Some(claim) = self.claims.get(&key) else {
+            return;
+        };
+        let terminal = claim.is_terminal();
+        let source_bytes: u64 = claim
+            .windows
+            .iter()
+            .filter(|w| w.phase == Phase::SourceWrite)
+            .map(|w| w.plan.length)
+            .sum();
+        let requester_bytes: u64 = claim
+            .windows
+            .iter()
+            .filter(|w| w.phase == Phase::RequesterRead)
+            .map(|w| w.plan.length)
+            .sum();
+        let mut to_log: Vec<(usize, String)> = Vec::new();
+        for (idx, p) in claim.parties.iter().enumerate() {
+            if p.quarantine_logged || !p.memory {
+                continue;
+            }
+            let bytes = if p.source {
+                source_bytes
+            } else {
+                requester_bytes
+            };
+            let reason = match p.owner {
+                Owner::Proc(proc) if self.proc_exited_flag(&proc) => None,
+                Owner::Proc(_) if p.state == Party::Quarantined => {
+                    Some("party attested QUARANTINED")
+                }
+                Owner::Proc(proc)
+                    if terminal
+                        && bytes > 0
+                        && p.state == Party::Pending
+                        && !self.process_connected(proc) =>
+                {
+                    Some("process disconnected with unfenced windows")
+                }
+                Owner::Leg(_) if terminal && bytes > 0 && p.state == Party::Pending => {
+                    Some("data-channel handler did not exit after stop")
+                }
+                _ => None,
+            };
+            if let Some(why) = reason {
+                let role = if p.source { "source" } else { "requester" };
+                let owner = match p.owner {
+                    Owner::Proc(_) => "process".to_string(),
+                    Owner::Leg(transfer) => format!("data-channel transfer {transfer}"),
+                    Owner::Store => "store".to_string(),
+                };
+                to_log.push((
+                    idx,
+                    format!(
+                        "quarantined claim {} {role} ({owner}): {why} ({bytes} bytes held)",
+                        key.2
+                    ),
+                ));
+            }
+        }
+        if to_log.is_empty() {
+            return;
+        }
+        if let Some(claim) = self.claims.get_mut(&key) {
+            for (idx, _) in &to_log {
+                if let Some(p) = claim.parties.get_mut(*idx) {
+                    p.quarantine_logged = true;
+                }
+            }
+        }
+        for (_, message) in to_log {
+            self.emit_quarantine_log(message);
+        }
+    }
+
+    /// Log any newly quarantined claim or put obligations after `proc` disconnected.
+    pub(super) fn note_proc_quarantines(&mut self, proc: ProcKey) {
+        let claim_keys: Vec<ClaimKey> = self
+            .claims
+            .iter()
+            .filter(|(_, claim)| {
+                claim.is_terminal()
+                    && claim
+                        .parties
+                        .iter()
+                        .any(|p| p.owner == Owner::Proc(proc) && !p.quarantine_logged)
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for key in claim_keys {
+            self.note_claim_quarantines(key);
+        }
+        let put_keys: Vec<super::store_bridge::PutKey> = self
+            .puts
+            .iter()
+            .filter(|(_, rec)| {
+                rec.parties
+                    .iter()
+                    .any(|p| p.owner == Owner::Proc(proc) && !p.quarantine_logged)
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for key in put_keys {
+            self.note_put_quarantines(key);
+        }
     }
 
     pub(super) fn claim_timers(&mut self, now: Instant) {
@@ -2115,6 +2243,9 @@ impl Core {
             return;
         };
         attest(&mut claim.parties, Owner::Proc(agent), party, false);
+        if party == Party::Quarantined {
+            self.note_claim_quarantines(key);
+        }
         self.reclaim(key);
     }
 
@@ -2257,7 +2388,13 @@ pub(super) fn shape_for(
         row: spec.row,
         length: spec.packed.as_ref().map_or_else(
             || layout.slice_bytes(rank, spec.page_count, spec.row),
-            |_| spec.length,
+            |manifest| {
+                if layout.world() > 1 {
+                    flare_selene::shared::packed::rank_window_bytes(manifest, rank as u32)
+                } else {
+                    spec.length
+                }
+            },
         ),
     }
 }
@@ -2379,12 +2516,14 @@ mod tests {
                 source: false,
                 memory: true,
                 state: Party::Pending,
+                quarantine_logged: false,
             },
             Participant {
                 owner: Owner::Store,
                 source: true,
                 memory: false,
                 state: Party::Pending,
+                quarantine_logged: false,
             },
         ];
         claim.manager = Some(ManagerGet {
@@ -2481,6 +2620,7 @@ mod tests {
                     source: true,
                     memory: true,
                     state: Party::Quarantined,
+                    quarantine_logged: false,
                 }],
                 refused: false,
                 key: crate::Key::default(),
@@ -2645,6 +2785,7 @@ mod tests {
             source: claim.legs[0].source,
             memory: true,
             state: Party::Pending,
+            quarantine_logged: false,
         });
         core.channels.insert(transfer, ChanOwner::Claim(key));
         core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
@@ -2661,6 +2802,14 @@ mod tests {
         core.claim_timers(Instant::now());
         assert_eq!(core.quarantined_bytes(), 6 * 4096);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
+        assert_eq!(core.quarantine_logs.len(), 1);
+        core.reclaim(key);
+        core.claim_timers(Instant::now());
+        assert_eq!(
+            core.quarantine_logs.len(),
+            1,
+            "handler quarantine event must be logged once"
+        );
         // Seeing the exit is the proof that nothing reads the window any more.
         core.channel_event(channel::Event::Closed { transfer });
         assert_eq!(core.quarantined_bytes(), 0);
@@ -2723,6 +2872,7 @@ mod tests {
             source: claim.legs[0].source,
             memory: true,
             state: Party::Pending,
+            quarantine_logged: false,
         });
         core.channels.insert(transfer, ChanOwner::Source(key));
         core.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
@@ -2734,6 +2884,13 @@ mod tests {
         core.claim_timers(Instant::now());
         assert_eq!(core.quarantined_bytes(), 6 * 4096);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::SourceWrite);
+        assert_eq!(core.quarantine_logs.len(), 1);
+        core.reclaim(key);
+        assert_eq!(
+            core.quarantine_logs.len(),
+            1,
+            "source leg quarantine event must be logged once"
+        );
         core.channel_event(channel::Event::Closed { transfer });
         assert_eq!(core.quarantined_bytes(), 0);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::Free);
@@ -2814,12 +2971,14 @@ mod tests {
             source: false,
             memory: true,
             state: Party::Pending,
+            quarantine_logged: false,
         });
         claim.parties.push(Participant {
             owner: Owner::Leg(99),
             source: false,
             memory: true,
             state: Party::Pending,
+            quarantine_logged: false,
         });
         key
     }
@@ -2918,6 +3077,10 @@ mod tests {
         core.reclaim(key);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
         assert_eq!(core.quarantined_bytes(), 6 * 4096);
+        let logs_before = core.quarantine_logs.len();
+        assert_eq!(logs_before, 1);
+        core.reclaim(key);
+        assert_eq!(core.quarantine_logs.len(), logs_before);
         core.agent_fence(
             AGENT_1,
             v2::rank_fence::Kind::Claim as i32,
@@ -2925,9 +3088,82 @@ mod tests {
             Party::Drained,
         );
         assert_eq!(core.claims[&key].windows[0].phase, Phase::RequesterRead);
+        assert_eq!(core.quarantine_logs.len(), logs_before);
         core.proc_exited(AGENT_1);
         assert_eq!(core.claims[&key].windows[0].phase, Phase::Free);
         assert_eq!(core.quarantined_bytes(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quarantine_events_from_disconnect_and_attestation_are_logged_once() {
+        // 1. Local process disconnects without FenceAck while still alive -> logged once.
+        let (mut core1, _out) = core();
+        core1.procs.insert(
+            (INSTANCE, NONCE),
+            crate::pool::core::Proc {
+                pid: None,
+                pidfd: None,
+                exited: false,
+                claim_hw: 0,
+                put_hw: 0,
+                idle_since: None,
+                link: None,
+            },
+        );
+        let key = delivered(&mut core1);
+        core1.claims.get_mut(&key).unwrap().windows[0].phase = Phase::RequesterRead;
+        core1.finish(key, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
+        assert_eq!(core1.quarantined_bytes(), 0);
+        assert!(core1.quarantine_logs.is_empty());
+        core1.session_lost(1);
+        assert_eq!(core1.quarantined_bytes(), 6 * 4096);
+        assert_eq!(core1.quarantine_logs.len(), 1);
+        assert!(
+            core1.quarantine_logs[0].contains("disconnected with unfenced windows"),
+            "{:?}",
+            core1.quarantine_logs
+        );
+        core1.reclaim(key);
+        core1.claim_timers(Instant::now());
+        assert_eq!(core1.quarantine_logs.len(), 1);
+
+        // 2. Connected session explicitly attests QUARANTINED -> logged once.
+        let (mut core2, _out2) = core();
+        core2.procs.insert(
+            (INSTANCE, NONCE),
+            crate::pool::core::Proc {
+                pid: None,
+                pidfd: None,
+                exited: false,
+                claim_hw: 0,
+                put_hw: 0,
+                idle_since: None,
+                link: None,
+            },
+        );
+        let key2 = delivered(&mut core2);
+        core2.claims.get_mut(&key2).unwrap().windows[0].phase = Phase::RequesterRead;
+        core2.finish(key2, v2::ClaimState::Failed, v2::ClaimReason::Cancelled);
+        assert!(core2.quarantine_logs.is_empty());
+        core2
+            .fence_ack(
+                1,
+                v2::FenceAck {
+                    subject: Some(v2::fence_ack::Subject::ClaimId(1)),
+                    outcome: v2::FenceOutcome::Quarantined as i32,
+                },
+            )
+            .unwrap();
+        assert_eq!(core2.quarantined_bytes(), 6 * 4096);
+        assert_eq!(core2.quarantine_logs.len(), 1);
+        assert!(
+            core2.quarantine_logs[0].contains("QUARANTINED"),
+            "{:?}",
+            core2.quarantine_logs
+        );
+        core2.reclaim(key2);
+        core2.session_lost(1);
+        assert_eq!(core2.quarantine_logs.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

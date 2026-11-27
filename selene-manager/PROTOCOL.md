@@ -507,8 +507,7 @@ pidfd through `SO_PEERPIDFD`. Socket closure alone is never exit proof; the pidf
 becomes readable after the process has fully exited.
 
 - The manager counts quarantined bytes in `selene_pool_quarantined_bytes` and
-  logs each quarantine event once (designed, not implemented: it logs only a
-  failed RDMA queue-pair teardown). Claims that cannot get windows fail
+  logs each quarantine event once. Claims that cannot get windows fail
   `NO_WINDOWS` immediately. Nothing waits for quarantined memory.
 - On the client, a registration handle whose drain failed keeps its region alive
   and mapped (`HostRegistrar` contract); a GPU pin whose copy cannot be drained

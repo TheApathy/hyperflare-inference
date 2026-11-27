@@ -11,10 +11,12 @@ use crate::{
     disk_store::{DiskTransport, FetchSegment, Staged, TransportEvent},
     geometry::invalid,
     record::{self, HEADER_BYTES, Header, Scanned},
+    shared::{packed, wire},
 };
+use prost::Message as _;
 use std::{
     collections::HashMap,
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     net::{Shutdown, TcpStream},
     path::{Path, PathBuf},
     sync::{
@@ -544,6 +546,8 @@ struct Pending {
     results: Vec<Option<Result<u64>>>,
     /// Rank zero's committed header (carrying packed v4 metadata when compressed).
     header: Option<Box<Header>>,
+    /// Per-rank single-rank packed offers (index = rank) for world-wide v4 assembly.
+    offers: Vec<Option<wire::PackedOffer>>,
     /// A store's record file, removed from the ranks that wrote it when another rank failed.
     path: Option<PathBuf>,
     /// The store a cleanup unlink belongs to, with the failure it reports.
@@ -557,6 +561,7 @@ pub struct Sharded {
     local: Staged,
     peers: Vec<Link>,
     pending: HashMap<(Kind, JobId), Pending>,
+    world_packed: HashMap<JobId, Arc<packed::Layout>>,
     events: Vec<TransportEvent>,
     next_internal: u64,
     closed: bool,
@@ -571,6 +576,7 @@ impl Sharded {
             local,
             peers,
             pending: HashMap::new(),
+            world_packed: HashMap::new(),
             events: Vec::new(),
             next_internal: INTERNAL_JOBS,
             closed: false,
@@ -605,6 +611,7 @@ impl Sharded {
                 kind,
                 results,
                 header: None,
+                offers: vec![None; self.ranks()],
                 path,
                 cleanup: None,
                 started: Instant::now(),
@@ -612,13 +619,14 @@ impl Sharded {
         );
     }
 
-    fn record_with_header(
+    fn record_with_offer(
         &mut self,
         kind: Kind,
         id: JobId,
         rank: usize,
         result: Result<u64>,
         header: Option<Box<Header>>,
+        offer: Option<wire::PackedOffer>,
     ) {
         if self.poison.is_some() {
             return;
@@ -626,8 +634,16 @@ impl Sharded {
         let Some(pending) = self.pending.get_mut(&(kind, id)) else {
             return;
         };
-        if rank == 0 && header.is_some() {
-            pending.header = header;
+        if rank == 0
+            && let Some(header) = header
+        {
+            if let Some(layout) = &header.packed {
+                pending.offers[0] = Some(layout.offer().clone());
+            }
+            pending.header = Some(header);
+        }
+        if let Some(offer) = offer {
+            pending.offers[rank] = Some(offer);
         }
         if pending.results[rank].is_none() {
             pending.results[rank] = Some(result);
@@ -638,11 +654,12 @@ impl Sharded {
         }
     }
 
+    #[cfg(test)]
     fn record(&mut self, kind: Kind, id: JobId, rank: usize, result: Result<u64>) {
-        self.record_with_header(kind, id, rank, result, None);
+        self.record_with_offer(kind, id, rank, result, None, None);
     }
 
-    fn finish(&mut self, id: JobId, pending: Pending) {
+    fn finish(&mut self, id: JobId, mut pending: Pending) {
         let failure = pending
             .results
             .iter()
@@ -675,11 +692,49 @@ impl Sharded {
         let Some(error) = failure else {
             let result = pending.results[0].as_ref().map_or(Ok(0), copy);
             let event = match pending.kind {
-                Kind::Stored => TransportEvent::Stored {
-                    id,
-                    result,
-                    header: pending.header,
-                },
+                Kind::Stored => {
+                    let any_packet = pending
+                        .offers
+                        .iter()
+                        .flatten()
+                        .any(offer_has_packet);
+                    if any_packet
+                        && let (Ok(bytes), Some(header)) = (&result, pending.header.as_ref())
+                    {
+                        let row = header.row_present(*bytes);
+                        if pending.offers[0].is_none()
+                            && let Some(path) = pending.path.as_deref()
+                            && let Ok(offer) = offer_from_file(path, header, row)
+                        {
+                            pending.offers[0] = offer;
+                        }
+                        if let Some(offers) = pending
+                            .offers
+                            .iter()
+                            .cloned()
+                            .collect::<Option<Vec<_>>>()
+                        {
+                            let world_ranks = vec![header.ranks[0].clone(); self.ranks()];
+                            let first_page = header
+                                .parent
+                                .map_or(0, |p| p.consumed_tokens / header.page_tokens);
+                            if let Ok(layout) = packed::merge_rank_offers(
+                                &offers,
+                                &world_ranks,
+                                first_page,
+                                header.tail_pages,
+                                row,
+                            ) {
+                                self.world_packed.insert(id, Arc::new(layout));
+                            }
+                        }
+                    }
+                    TransportEvent::Stored {
+                        id,
+                        result,
+                        header: pending.header,
+                    }
+                }
                 kind => kind.event(id, result),
             };
             self.events.push(event);
@@ -727,6 +782,7 @@ impl Sharded {
             kind: Kind::Unlinked,
             results,
             header: None,
+            offers: vec![None; self.ranks()],
             path: None,
             cleanup: Some((store, error)),
             started: Instant::now(),
@@ -747,7 +803,7 @@ impl Sharded {
                 TransportEvent::Stored { header, .. } => header,
                 _ => None,
             };
-            self.record_with_header(kind, id, 0, result, header);
+            self.record_with_offer(kind, id, 0, result, header, None);
         }
     }
 
@@ -759,7 +815,9 @@ impl Sharded {
                 match received {
                     Ok(None) => break,
                     Ok(Some((EVENT, payload))) => match decode_event(&payload) {
-                        Ok((kind, id, result)) => self.record(kind, id, rank, result),
+                        Ok((kind, id, result, offer)) => {
+                            self.record_with_offer(kind, id, rank, result, None, offer)
+                        }
                         Err(error) => {
                             self.peers[index].fail(error);
                         }
@@ -820,11 +878,52 @@ impl Sharded {
     }
 }
 
+fn offer_has_packet(offer: &wire::PackedOffer) -> bool {
+    offer.units.iter().any(|u| {
+        u.representation == wire::packed_unit::Representation::Packet as i32
+    })
+}
+
+fn offer_from_file(path: &Path, header: &Header, row: bool) -> Result<Option<wire::PackedOffer>> {
+    if let Some(layout) = &header.packed {
+        return Ok(Some(layout.offer().clone()));
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|e| record::io_failure("open raw shard record", e))?;
+    let mut stored = vec![0u8; header.tail_pages as usize * 8];
+    file.seek(SeekFrom::Start(header.checksum_segment()))
+        .and_then(|_| file.read_exact(&mut stored))
+        .map_err(|e| record::io_failure("read raw shard record checksums", e))?;
+    let page_sums: Vec<u64> = stored
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    Ok(Some(packed::literal_offer_from_raw(header, &page_sums, row)?))
+}
+
 fn encode_event(kind: Kind, id: JobId, result: &Result<u64>) -> Vec<u8> {
+    encode_event_with_offer(kind, id, result, None)
+}
+
+fn encode_event_with_offer(
+    kind: Kind,
+    id: JobId,
+    result: &Result<u64>,
+    offer: Option<&wire::PackedOffer>,
+) -> Vec<u8> {
     let mut writer = Writer::new(EVENT);
     writer.u8(kind.code()).u64(id.0);
     match result {
-        Ok(value) => writer.u8(1).u64(*value),
+        Ok(value) => {
+            writer.u8(1).u64(*value);
+            if kind == Kind::Stored {
+                if let Some(offer) = offer {
+                    writer.u8(1).blob(&offer.encode_to_vec());
+                } else {
+                    writer.u8(0);
+                }
+            }
+        }
         Err(error) => {
             let code = if error.is_record_read() {
                 3
@@ -833,18 +932,29 @@ fn encode_event(kind: Kind, id: JobId, result: &Result<u64>) -> Vec<u8> {
             } else {
                 0
             };
-            writer.u8(code).text(&error.to_string())
+            writer.u8(code).text(&error.to_string());
         }
     };
     writer.finish()
 }
 
-fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
+fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>, Option<wire::PackedOffer>)> {
     let mut reader = Reader(payload);
     let kind = Kind::decode(reader.u8()?)?;
     let id = JobId(reader.u64()?);
+    let mut offer = None;
     let result = match reader.u8()? {
-        1 => Ok(reader.u64()?),
+        1 => {
+            let value = reader.u64()?;
+            if kind == Kind::Stored && !reader.0.is_empty() && reader.boolean()? {
+                let bytes = reader.blob()?;
+                offer = Some(
+                    wire::PackedOffer::decode(bytes)
+                        .map_err(|_| invalid("malformed packed offer in shard event"))?,
+                );
+            }
+            Ok(value)
+        }
         0 => Err(invalid(reader.text()?.to_owned())),
         2 => Err(Error::caused_by(
             reader.text()?.to_owned(),
@@ -854,7 +964,7 @@ fn decode_event(payload: &[u8]) -> Result<(Kind, JobId, Result<u64>)> {
         _ => return Err(invalid("invalid prefix record event result")),
     };
     reader.end()?;
-    Ok((kind, id, result))
+    Ok((kind, id, result, offer))
 }
 
 impl DiskTransport for Sharded {
@@ -868,6 +978,10 @@ impl DiskTransport for Sharded {
 
     fn decode_counters(&self) -> Option<crate::codec_copy::DecodeCounters> {
         self.local.decode_counters()
+    }
+
+    fn take_world_packed(&mut self, id: JobId) -> Option<Arc<packed::Layout>> {
+        self.world_packed.remove(&id)
     }
 
     fn store_empty(
@@ -1020,7 +1134,9 @@ impl DiskTransport for Sharded {
             let result = loop {
                 match self.peers[index].receive() {
                     Ok(Some((EVENT, payload))) => match decode_event(&payload) {
-                        Ok((kind, id, result)) => self.record(kind, id, rank, result),
+                        Ok((kind, id, result, offer)) => {
+                            self.record_with_offer(kind, id, rank, result, None, offer)
+                        }
                         Err(error) => break Err(self.peers[index].fail(error)),
                     },
                     Ok(Some((CLOSED, payload))) => break decode_closed(&payload),
@@ -1201,9 +1317,32 @@ impl Peer {
     fn forward(&mut self) -> Result<()> {
         let mut events = Vec::new();
         self.staged.poll(&mut events)?;
+        let compression = self
+            .geometry
+            .first()
+            .map(|g| g.placement)
+            .unwrap_or_default();
         for event in &events {
             let (kind, id, result) = Kind::of(event);
-            self.link.send(&encode_event(kind, id, &result))?;
+            let offer = match event {
+                TransportEvent::Stored {
+                    result: Ok(bytes),
+                    header: Some(header),
+                    ..
+                } => {
+                    if let Some(layout) = &header.packed {
+                        Some(layout.offer().clone())
+                    } else if compression != crate::offload::KvCompression::Off {
+                        let path = self.directory.join(record::file_name(&header.key));
+                        offer_from_file(&path, header, header.row_present(*bytes))?
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            self.link
+                .send(&encode_event_with_offer(kind, id, &result, offer.as_ref()))?;
         }
         Ok(())
     }
@@ -1281,13 +1420,32 @@ pub fn serve(mut peer: Peer) -> Result<()> {
 
 /// What a rank's scan holds, as the agreement compares it.
 pub fn summary(scanned: &[Scanned]) -> Result<Vec<u8>> {
+    summary_with_literals(scanned, false)
+}
+
+/// Same as [`summary`], also attaching single-rank literal offers for v3 files
+/// when `include_literals` is set so mixed compressed/literal shards agree on a
+/// world-wide v4 directory.
+pub fn summary_with_literals(scanned: &[Scanned], include_literals: bool) -> Result<Vec<u8>> {
     let mut writer = Writer::new(SUMMARY);
     writer.u32(scanned.len() as u32);
     for record in scanned {
+        let offer = if let Some(layout) = &record.header.packed {
+            Some(layout.offer().clone())
+        } else if include_literals {
+            offer_from_file(&record.path, &record.header, record.row)?
+        } else {
+            None
+        };
         writer
             .key(&record.header.key)
             .bytes(&shape(&record.header)?)
             .u8(record.row as u8);
+        if let Some(offer) = offer {
+            writer.u8(1).blob(&offer.encode_to_vec());
+        } else {
+            writer.u8(0);
+        }
     }
     Ok(writer.finish())
 }
@@ -1321,14 +1479,39 @@ fn shape(header: &Header) -> Result<[u8; 16]> {
     Ok(hash.finalize().into())
 }
 
+pub type SummaryEntry = ([u8; 16], bool, Option<wire::PackedOffer>);
+
+/// Agreed record keys (with row presence) and their assembled world-wide v4 packed layouts.
+pub type AgreedWithPacked = (
+    HashMap<PrefixKey, bool>,
+    HashMap<PrefixKey, Arc<packed::Layout>>,
+);
+
 pub fn decode_summary(payload: &[u8]) -> Result<HashMap<PrefixKey, ([u8; 16], bool)>> {
+    Ok(decode_summary_with_packed(payload)?
+        .into_iter()
+        .map(|(k, (s, r, _))| (k, (s, r)))
+        .collect())
+}
+
+pub fn decode_summary_with_packed(payload: &[u8]) -> Result<HashMap<PrefixKey, SummaryEntry>> {
     let mut reader = Reader(payload);
     let count = reader.count(41)?;
     let mut records = HashMap::with_capacity(count);
     for _ in 0..count {
         let key = reader.key()?;
         let shape: [u8; 16] = reader.take(16)?.try_into().unwrap();
-        records.insert(key, (shape, reader.u8()? != 0));
+        let row = reader.u8()? != 0;
+        let offer = if !reader.0.is_empty() && reader.boolean()? {
+            let bytes = reader.blob()?;
+            Some(
+                wire::PackedOffer::decode(bytes)
+                    .map_err(|_| invalid("malformed packed offer in shard summary"))?,
+            )
+        } else {
+            None
+        };
+        records.insert(key, (shape, row, offer));
     }
     reader.end()?;
     Ok(records)
@@ -1340,20 +1523,87 @@ pub fn agree(
     scanned: &[Scanned],
     peers: &[HashMap<PrefixKey, ([u8; 16], bool)>],
 ) -> Result<HashMap<PrefixKey, bool>> {
+    let peers_packed: Vec<HashMap<PrefixKey, SummaryEntry>> = peers
+        .iter()
+        .map(|peer| {
+            peer.iter()
+                .map(|(&k, &(s, r))| (k, (s, r, None)))
+                .collect()
+        })
+        .collect();
+    Ok(agree_with_packed(scanned, &peers_packed)?.0)
+}
+
+/// Same as [`agree`], also assembling world-wide v4 [`packed::Layout`] entries
+/// for agreed records where at least one rank stores compressed packets.
+pub fn agree_with_packed(
+    scanned: &[Scanned],
+    peers: &[HashMap<PrefixKey, SummaryEntry>],
+) -> Result<AgreedWithPacked> {
     let mut agreed = HashMap::new();
+    let mut world_packed = HashMap::new();
+    let world = peers.len() + 1;
     for record in scanned {
         let shape = shape(&record.header)?;
         let mut row = record.row;
         let everywhere = peers.iter().all(|peer| match peer.get(&record.header.key) {
-            Some((peer_shape, peer_row)) if *peer_shape == shape => {
+            Some((peer_shape, peer_row, _)) if *peer_shape == shape => {
                 row &= peer_row;
                 true
             }
             _ => false,
         });
-        if everywhere {
-            agreed.insert(record.header.key, row);
+        if !everywhere {
+            continue;
         }
+        let any_packet = record
+            .header
+            .packed
+            .as_ref()
+            .is_some_and(|l| offer_has_packet(l.offer()))
+            || peers.iter().any(|peer| {
+                peer.get(&record.header.key)
+                    .and_then(|(_, _, offer)| offer.as_ref())
+                    .is_some_and(offer_has_packet)
+            });
+        if any_packet {
+            let mut offers = Vec::with_capacity(world);
+            let Some(zero_offer) = offer_from_file(&record.path, &record.header, row)? else {
+                continue;
+            };
+            offers.push(zero_offer);
+            let mut complete = true;
+            for peer in peers {
+                if let Some(offer) = peer
+                    .get(&record.header.key)
+                    .and_then(|(_, _, offer)| offer.clone())
+                {
+                    offers.push(offer);
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            if !complete {
+                continue;
+            }
+            let world_ranks = vec![record.header.ranks[0].clone(); world];
+            let first_page = record
+                .header
+                .parent
+                .map_or(0, |p| p.consumed_tokens / record.header.page_tokens);
+            let Ok(layout) = packed::merge_rank_offers(
+                &offers,
+                &world_ranks,
+                first_page,
+                record.header.tail_pages,
+                row,
+            ) else {
+                continue;
+            };
+            world_packed.insert(record.header.key, Arc::new(layout));
+        }
+        agreed.insert(record.header.key, row);
     }
     let parents: HashMap<PrefixKey, Option<PrefixKey>> = scanned
         .iter()
@@ -1366,7 +1616,8 @@ pub fn agree(
             .copied()
             .collect();
         if orphans.is_empty() {
-            return Ok(agreed);
+            world_packed.retain(|k, _| agreed.contains_key(k));
+            return Ok((agreed, world_packed));
         }
         for key in orphans {
             agreed.remove(&key);

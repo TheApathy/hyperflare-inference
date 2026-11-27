@@ -27,8 +27,9 @@ use crate::{
     geometry::invalid,
     record,
     shard::{
-        AGREED, HANDSHAKE_TIMEOUT, HELLO, IDLE, Link, Peer, Reader, SUMMARY, Writer, agree,
-        decode_agreed, decode_summary, encode_agreed, nonce, serve, summary,
+        AGREED, HANDSHAKE_TIMEOUT, HELLO, IDLE, Link, Peer, Reader, SUMMARY, Writer,
+        agree_with_packed, decode_agreed, decode_summary_with_packed, encode_agreed, nonce, serve,
+        summary_with_literals,
     },
 };
 use std::{
@@ -333,15 +334,16 @@ pub fn join_rank_zero(
     let mut links: Vec<Link> = links.into_iter().map(Option::unwrap).collect();
     let summaries = links
         .iter_mut()
-        .map(|link| decode_summary(&link.expect(SUMMARY, REPLY_TIMEOUT)?))
+        .map(|link| decode_summary_with_packed(&link.expect(SUMMARY, REPLY_TIMEOUT)?))
         .collect::<Result<Vec<_>>>()?;
-    let agreed = agree(&prepared.scanned, &summaries)?;
+    let (agreed, world_packed) = agree_with_packed(&prepared.scanned, &summaries)?;
     let frame = encode_agreed(&agreed);
     for link in &mut links {
         link.send(&frame)?;
     }
     let scanned = prepared.scanned.len();
     retain(prepared, &agreed)?;
+    prepared.world_packed = world_packed;
     prepared.shards = links;
     Ok(Some(format!(
         "{} of {scanned} records on every rank, limit {}",
@@ -465,7 +467,10 @@ pub fn join_peer(
         transfers,
         DiskThread::start("flare-offload-disk")?,
     );
-    link.send(&summary(&prepared.scanned)?)?;
+    link.send(&summary_with_literals(
+        &prepared.scanned,
+        compression != super::KvCompression::Off,
+    )?)?;
     let agreed = decode_agreed(&link.expect(AGREED, REPLY_TIMEOUT)?)?;
     retain(&mut prepared, &agreed)?;
     let summary = format!(

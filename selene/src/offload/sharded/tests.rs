@@ -523,7 +523,7 @@ fn sharded_compressed_v4_store_fetch_truncate_and_restart_agree() {
 }
 
 #[test]
-fn sharded_pool_with_compression_rejected_at_startup() {
+fn sharded_pool_with_compression_accepted_at_startup() {
     let local = geometry(64, &[("kv", 4096)], 3 * 4096);
     for compression in [offload::KvCompression::Cpu, offload::KvCompression::Gpu] {
         let options = PrefixCacheOffload {
@@ -534,7 +534,7 @@ fn sharded_pool_with_compression_rejected_at_startup() {
             }),
             ..Default::default()
         };
-        let err = offload::prepare_with_inputs(
+        let prepared = offload::prepare_with_inputs(
             &options,
             std::path::Path::new("."),
             [1; 32],
@@ -545,11 +545,11 @@ fn sharded_pool_with_compression_rejected_at_startup() {
             Some((0, 2)),
             &IdentityRegistrar,
         )
-        .err()
-        .expect("sharded --ranks + --prefix-cache-pool + compression must be rejected");
+        .expect("sharded --rank + --prefix-cache-pool + compression must be accepted");
         assert!(
-            err.to_string().contains("multi-host --rank"),
-            "unexpected error: {err}"
+            matches!(prepared, offload::Preparation::Store(_)),
+            "expected a prepared store, got: {}",
+            prepared.summary()
         );
     }
 }

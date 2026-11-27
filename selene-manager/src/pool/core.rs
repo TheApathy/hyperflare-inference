@@ -382,6 +382,8 @@ pub struct Core {
     pub(super) shutting_down: Option<oneshot::Sender<()>>,
     pub(super) euid: u32,
     pub(super) egid: u32,
+    #[cfg(test)]
+    pub(super) quarantine_logs: Vec<String>,
 }
 
 pub fn random_incarnation() -> u64 {
@@ -450,9 +452,17 @@ impl Core {
             shutting_down: None,
             euid,
             egid,
+            #[cfg(test)]
+            quarantine_logs: Vec::new(),
         };
         core.update_readiness();
         (core, PoolHandle { events, shared }, receiver)
+    }
+
+    pub(super) fn emit_quarantine_log(&mut self, message: String) {
+        eprintln!("selene: {message}");
+        #[cfg(test)]
+        self.quarantine_logs.push(message);
     }
 
     /// Says once per scope, when its geometry first arrives, whether the staging region
@@ -776,6 +786,7 @@ impl Core {
         }
         self.session_claims_lost(sid, &session);
         self.puts_lost(&session);
+        self.note_proc_quarantines(proc_key);
         if session.ranks.is_some() && is_current && self.reconnecting != Some(proc_key) {
             self.rank0_lost(session.instance, session.nonce);
         }

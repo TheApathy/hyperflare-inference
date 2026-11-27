@@ -7,10 +7,6 @@
     buffered and streamed, including max_tokens and max_output_tokens truncation.
     Close when a served TMLv0 core passes those checks and the result is recorded.
 
-[ ] Make test_explicit_worker_budget_compiles_and_replays_a_catalog account for
-    host memory admission. Its nine-worker assertion requires 296 GiB available
-    under the 32 GiB worker allowance and 8 GiB headroom; smaller hosts admit fewer.
-
 [ ] Add metadata-only publisher-key review for legacy cores whose verification
     opens companion files before acquisition has fetched them. The desktop key
     import dialog verifies payload-core catalogs before downloading companions;
@@ -46,11 +42,6 @@
     Qwen, GLM, DeepSeek, MiMo, Step, and Nemotron services with warm timing
     catalogs, host copy-out pressure, and tensor-parallel execution. See
     core-design.md#exact-endpoint-capture and scheduling-runtime-design.md.
-
-[ ] Correct the 10-byte core payload fixtures in Orbit agent tests
-    running_groups_are_stopped_and_outlive_their_controller_session and
-    groups_run_together_on_disjoint_gpus_and_status_lists_them; their transfer
-    ranges and file-size assertions currently require 13 bytes.
 
 [ ] Validate multi-window image prefill, prefix skipping, and CPU record reuse
     through DeepSeek, MiMo, Kimi, and Nemotron services. Extend Step TP4 coverage
@@ -190,19 +181,10 @@
     + `--lossless-kv-compression cpu|gpu`) on a multi-host cluster; unit tests
     cover sharded v4 store/fetch/truncate/agreement and mismatch rejection.
 
-[ ] Support `--lossless-kv-compression cpu|gpu` with multi-host `--rank` +
-    `--prefix-cache-pool` by building world-wide packed offers and teaching
-    `selene/src/pool/records.rs` v4 headers, directories, and packed slicing
-    (currently rejected at startup in `selene/src/offload.rs`).
-
 [ ] Qualify multi-host pool-only serving (`--rank` + `--prefix-cache-pool`
     without `--prefix-cache-disk`) on separate hosts (startup and rank join
     accept restore-only pool stores; live multi-host restore serving remains
     untested on a physical cluster).
-
-[ ] Log each Selene manager quarantine event once, as PROTOCOL.md section 7.4
-    specifies; the manager logs only a failed RDMA queue-pair teardown
-    (selene-manager/src/data/channel.rs).
 
 [ ] Add a two-host data-channel procedure over TCP and TLS, with pass
     conditions, to selene-manager/docs/qualification.md; the suites in
@@ -210,15 +192,6 @@
 
 [ ] Confirm the O_DIRECT startup-exit cause in selene-manager/docs/operating.md;
     Store::open in selene-manager/src/store.rs probes only io_uring.
-
-[ ] Correct comments in selene/proto/selene.proto that contradict the
-    implementation: the location of instance_id and scope_id (they are in
-    selene/src/shared/identity.rs), "replaced atomically" for superseded
-    sessions, the size check ordering relative to pinning, GENERATION_CHANGED
-    as a claim reason, and the BUDGET refusal advancing a record to the next
-    tier. Publish the metrics port in
-    selene-manager/deploy/compose-network.yaml, which binds --metrics to the
-    container's loopback.
 
 [ ] Qualify RoCE ring transport beyond GLM-5.3 Flash TP4 on four DGX Sparks:
     other recipes, TP2 and TP3, and --roce-chain on hosts cabled as a chain.

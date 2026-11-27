@@ -75,12 +75,12 @@ pub struct WindowOut {
 }
 
 /// A put's window, granted by the store for the instance to fill.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct GrantOut {
     pub shape: Shape,
     pub region: Region,
     pub offset: u64,
-    pub packed: bool,
+    pub packed: Option<flare_selene::shared::wire::PackedWindow>,
 }
 
 /// What a handler reports. `Closed` is always last.
@@ -869,10 +869,11 @@ async fn receive_windows(
                 continue;
             }
             for grant in grants {
+                let shape = grant.shape;
                 // Tell the reader first: the instance may answer before this write returns.
                 let _ = expect.send(grant);
                 within(IO_TIMEOUT, "the instance stopped reading", async {
-                    ToInstance::Grant(grant.shape).write(&mut writer).await?;
+                    ToInstance::Grant(shape).write(&mut writer).await?;
                     writer.flush().await
                 })
                 .await?;
@@ -895,7 +896,7 @@ async fn receive_windows(
             else {
                 return Err(invalid("the instance sent a frame a put does not take"));
             };
-            let sums_ok = if grant.packed {
+            let sums_ok = if grant.packed.is_some() {
                 page_xxh3.is_empty() && row_xxh3.is_none()
             } else {
                 page_xxh3.len() == grant.shape.page_count as usize
@@ -905,8 +906,35 @@ async fn receive_windows(
                 return Err(invalid("a filled window does not match its grant"));
             }
             // SAFETY: the handler owns this window until `Closed`; the store leased this window to the put.
-            match entry.slicing.as_ref().filter(|_| !grant.packed) {
-                None => {
+            if let Some(manifest) = &grant.packed {
+                if let Some((_, rank)) = entry.slicing.as_ref().filter(|(l, _)| l.world() > 1) {
+                    let rank_u32 = *rank as u32;
+                    let expected_len =
+                        flare_selene::shared::packed::rank_window_bytes(manifest, rank_u32);
+                    if grant.shape.length != expected_len {
+                        return Err(invalid("a packed rank window's length is not its slice's"));
+                    }
+                    for (at, unit) in
+                        flare_selene::shared::packed::leg_units(manifest, Some(rank_u32))
+                    {
+                        if unit.stored_length == 0 {
+                            continue;
+                        }
+                        let dst = unsafe {
+                            inner.regions.bytes(
+                                grant.region,
+                                grant.offset + at,
+                                unit.stored_length,
+                            )?
+                        };
+                        within(
+                            IO_TIMEOUT,
+                            "the instance stopped writing",
+                            reader.read_exact(dst),
+                        )
+                        .await?;
+                    }
+                } else {
                     let payload = unsafe {
                         inner
                             .regions
@@ -919,29 +947,45 @@ async fn receive_windows(
                     )
                     .await?;
                 }
-                Some((layout, rank)) => {
-                    let (pages, row) = (grant.shape.page_count, grant.shape.row);
-                    if grant.shape.length != layout.slice_bytes(*rank, pages, row) {
-                        return Err(invalid("a rank window's length is not its slice's"));
+            } else {
+                match entry.slicing.as_ref() {
+                    None => {
+                        let payload = unsafe {
+                            inner
+                                .regions
+                                .bytes(grant.region, grant.offset, grant.shape.length)?
+                        };
+                        within(
+                            IO_TIMEOUT,
+                            "the instance stopped writing",
+                            reader.read_exact(payload),
+                        )
+                        .await?;
                     }
-                    let mut packed = vec![0u8; grant.shape.length as usize];
-                    within(
-                        IO_TIMEOUT,
-                        "the instance stopped writing",
-                        reader.read_exact(&mut packed),
-                    )
-                    .await?;
-                    // SAFETY: as above, over the whole window the slice lies in.
-                    let whole = unsafe {
-                        inner.regions.bytes(
-                            grant.region,
-                            grant.offset,
-                            layout.window_bytes(pages, row),
-                        )?
-                    };
-                    layout
-                        .scatter(*rank, whole, pages, row, &packed)
-                        .map_err(|error| invalid(error.to_string()))?;
+                    Some((layout, rank)) => {
+                        let (pages, row) = (grant.shape.page_count, grant.shape.row);
+                        if grant.shape.length != layout.slice_bytes(*rank, pages, row) {
+                            return Err(invalid("a rank window's length is not its slice's"));
+                        }
+                        let mut packed = vec![0u8; grant.shape.length as usize];
+                        within(
+                            IO_TIMEOUT,
+                            "the instance stopped writing",
+                            reader.read_exact(&mut packed),
+                        )
+                        .await?;
+                        // SAFETY: as above, over the whole window the slice lies in.
+                        let whole = unsafe {
+                            inner.regions.bytes(
+                                grant.region,
+                                grant.offset,
+                                layout.window_bytes(pages, row),
+                            )?
+                        };
+                        layout
+                            .scatter(*rank, whole, pages, row, &packed)
+                            .map_err(|error| invalid(error.to_string()))?;
+                    }
                 }
             }
             inner.counters.add(0, grant.shape.length);
@@ -1274,7 +1318,7 @@ mod tests {
                     shape: shape(0, 2, true),
                     region: Region::Staging,
                     offset: 4096,
-                    packed: false,
+                    packed: None,
                 },
             );
             let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap() else {
@@ -1315,7 +1359,7 @@ mod tests {
                     shape: shape(1, 1, false),
                     region: Region::Staging,
                     offset: 65536,
-                    packed: false,
+                    packed: None,
                 },
             );
             assert!(matches!(
@@ -1421,7 +1465,7 @@ mod tests {
                         shape: rank_shape(&layout, rank, 0, 2, true),
                         region: Region::Staging,
                         offset: 16384,
-                        packed: false,
+                        packed: None,
                     },
                 );
                 let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap()
@@ -1463,7 +1507,7 @@ mod tests {
                     shape: shape(0, 2, true),
                     region: Region::Staging,
                     offset: 16384,
-                    packed: false,
+                    packed: None,
                 },
             );
             let ToInstance::Grant(_) = ToInstance::read(&mut conn, 64).await.unwrap() else {
@@ -1491,6 +1535,142 @@ mod tests {
     }
 
     #[test]
+    fn packed_rank_put_legs_scatter_into_shared_window_and_reject_wrong_length() {
+        use flare_selene::shared::{
+            packed,
+            wire::{
+                PackedUnit, PackedWindow,
+                packed_unit::{Kind as UnitKind, Representation},
+            },
+        };
+        bounded(async {
+            let regions = regions();
+            let (hub, mut events, address) = start(regions.clone(), None);
+            let layout = rank_layout(2);
+
+            let r0_p0 = b"rank0-page0-compressed";
+            let r1_p0 = b"rank1-p0";
+            let r0_row = b"rank0-row-pkt";
+            let r1_row = b"rank1-row-compressed-bytes";
+            let mk = |kind: UnitKind, logical_index: u64, rank: u32, data: &[u8]| PackedUnit {
+                kind: kind as i32,
+                logical_index,
+                stored_rank: rank,
+                representation: Representation::Packet as i32,
+                profile: vec![0x33; 32],
+                original_length: if kind == UnitKind::Page { 8192 } else { 4096 },
+                stored_length: data.len() as u64,
+                replicas: Vec::new(),
+                stored_crc: packed::crc32(data),
+                original_crc: 100 + rank,
+                raw_xxh3: 0,
+            };
+            let manifest = PackedWindow {
+                units: vec![
+                    mk(UnitKind::Page, 0, 0, r0_p0),
+                    mk(UnitKind::Page, 0, 1, r1_p0),
+                    mk(UnitKind::Row, 0, 0, r0_row),
+                    mk(UnitKind::Row, 0, 1, r1_row),
+                ],
+            };
+            let truth = [
+                r0_p0.as_slice(),
+                r1_p0.as_slice(),
+                r0_row.as_slice(),
+                r1_row.as_slice(),
+            ]
+            .concat();
+
+            for (rank, slice) in [
+                (1usize, [r1_p0.as_slice(), r1_row.as_slice()].concat()),
+                (0usize, [r0_p0.as_slice(), r0_row.as_slice()].concat()),
+            ] {
+                let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), rank).unwrap();
+                let mut conn = connect(&address, &token).await;
+                let grant_shape = Shape {
+                    length: packed::rank_window_bytes(&manifest, rank as u32),
+                    ..shape(0, 1, true)
+                };
+                hub.push_grant(
+                    transfer,
+                    GrantOut {
+                        shape: grant_shape,
+                        region: Region::Staging,
+                        offset: 24576,
+                        packed: Some(manifest.clone()),
+                    },
+                );
+                let ToInstance::Grant(granted) = ToInstance::read(&mut conn, 64).await.unwrap()
+                else {
+                    panic!("expected packed grant");
+                };
+                assert_eq!(granted, grant_shape);
+                ToManager::Filled {
+                    index: 0,
+                    row_xxh3: None,
+                    page_xxh3: Vec::new(),
+                }
+                .write(&mut conn)
+                .await
+                .unwrap();
+                conn.write_all(&slice).await.unwrap();
+                let Event::Filled { index, .. } = next(&mut events).await else {
+                    panic!("expected Filled");
+                };
+                assert_eq!(index, 0);
+                hub.stop(transfer);
+                assert!(matches!(next(&mut events).await, Event::Closed { .. }));
+            }
+
+            // SAFETY: the test owns this window after both handlers closed.
+            unsafe {
+                let window = regions
+                    .bytes(Region::Staging, 24576, truth.len() as u64)
+                    .unwrap();
+                assert_eq!(window, &truth[..]);
+                packed::verify_units(&manifest.units, window).unwrap();
+            }
+
+            // A packed rank grant whose length does not match rank_window_bytes fails the leg.
+            let (transfer, token) = hub.open_rank(Kind::Put, layout.clone(), 0).unwrap();
+            let mut conn = connect(&address, &token).await;
+            hub.push_grant(
+                transfer,
+                GrantOut {
+                    shape: Shape {
+                        length: truth.len() as u64,
+                        ..shape(0, 1, true)
+                    },
+                    region: Region::Staging,
+                    offset: 24576,
+                    packed: Some(manifest),
+                },
+            );
+            let ToInstance::Grant(_) = ToInstance::read(&mut conn, 64).await.unwrap() else {
+                panic!("expected packed grant");
+            };
+            ToManager::Filled {
+                index: 0,
+                row_xxh3: None,
+                page_xxh3: Vec::new(),
+            }
+            .write(&mut conn)
+            .await
+            .unwrap();
+            conn.write_all(&truth).await.unwrap();
+            let mut failed = false;
+            loop {
+                match next(&mut events).await {
+                    Event::Failed { .. } => failed = true,
+                    Event::Closed { .. } => break,
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            assert!(failed);
+        })
+    }
+
+    #[test]
     fn a_filled_window_that_disagrees_with_its_grant_fails_the_put_without_writing() {
         bounded(async {
             let regions = regions();
@@ -1503,7 +1683,7 @@ mod tests {
                     shape: shape(0, 2, false),
                     region: Region::Staging,
                     offset: 0,
-                    packed: false,
+                    packed: None,
                 },
             );
             let _ = ToInstance::read(&mut conn, 64).await.unwrap();

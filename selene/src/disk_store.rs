@@ -67,11 +67,19 @@ const MAINTENANCE_IN_FLIGHT: usize = crate::shard::BACKLOG / 2;
 pub struct DiskRecord {
     pub path: PathBuf,
     pub header: Header,
+    /// World-wide v4 packed layout across all ranks of a multi-host sharded store.
+    pub world_packed: Option<Arc<crate::shared::packed::Layout>>,
     /// Reserved or committed file length. Unreserved DRAM records and
     /// discarded writes consume zero disk bytes.
     pub bytes: u64,
     /// A failed record remains indexed while its children refer to it.
     failed: bool,
+}
+
+impl DiskRecord {
+    fn pool_packed(&self) -> Option<&Arc<crate::shared::packed::Layout>> {
+        self.world_packed.as_ref().or(self.header.packed.as_ref())
+    }
 }
 
 /// Completion the transport reports to the disk store.
@@ -152,6 +160,10 @@ pub trait DiskTransport {
         Vec::new()
     }
     fn decode_counters(&self) -> Option<crate::codec_copy::DecodeCounters> {
+        None
+    }
+    /// World-wide v4 packed layout assembled across ranks for a completed sharded store.
+    fn take_world_packed(&mut self, _id: super::JobId) -> Option<Arc<crate::shared::packed::Layout>> {
         None
     }
 }
@@ -2139,6 +2151,7 @@ impl DiskStore {
                 DiskRecord {
                     path: record.path.clone(),
                     header: record.header.clone(),
+                    world_packed: None,
                     bytes: record.bytes,
                     failed: false,
                 },
@@ -2184,6 +2197,18 @@ impl DiskStore {
         })
     }
 
+    /// Attach world-wide packed layouts assembled across ranks during startup scan agreement.
+    pub fn set_world_packed(
+        &mut self,
+        layouts: HashMap<PrefixKey, Arc<crate::shared::packed::Layout>>,
+    ) {
+        for (key, layout) in layouts {
+            if let Some(node) = self.index.node_mut(&key) {
+                node.location.world_packed = Some(layout);
+            }
+        }
+    }
+
     /// Announce this store's records through `announcer` and serve them as
     /// exports. Recovered holdings are announced before this returns.
     pub fn announce_records(&mut self, announcer: Announcer) {
@@ -2210,7 +2235,7 @@ impl DiskStore {
         if !self.announce.as_ref()?.view.contains(key) {
             return None;
         }
-        let (bytes, packed, required_profiles) = match &node.location.header.packed {
+        let (bytes, packed, required_profiles) = match node.location.pool_packed() {
             Some(layout) => (
                 if node.row {
                     layout.physical_bytes()
@@ -2261,7 +2286,7 @@ impl DiskStore {
                         .node(&notice.key)
                         .filter(|n| !n.location.header.replicated())
                     {
-                        let packed = node.location.header.packed.as_ref().map(|layout| {
+                        let packed = node.location.pool_packed().map(|layout| {
                             let bytes = if notice.row {
                                 layout.physical_bytes()
                             } else {
@@ -2312,9 +2337,10 @@ impl DiskStore {
             }
             keys.push(cursor);
             nodes.push((cursor, node.tail_pages));
-            spans.push(FileSpan::new(
+            spans.push(FileSpan::with_world_packed(
                 node.location.path.clone(),
                 node.location.header.clone(),
+                node.location.world_packed.clone(),
             ));
             let start =
                 (cursor.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
@@ -2678,6 +2704,7 @@ impl DiskStore {
         let location = DiskRecord {
             path: path.clone(),
             header: header.clone(),
+            world_packed: None,
             bytes,
             failed: false,
         };
@@ -2708,7 +2735,7 @@ impl DiskStore {
         result: Result<u64>,
         header: Option<Header>,
     ) -> Result<()> {
-        self.finish_record(key, result, header, true)
+        self.finish_record(key, result, header, None, true)
     }
 
     fn finish_record(
@@ -2716,6 +2743,7 @@ impl DiskStore {
         key: PrefixKey,
         result: Result<u64>,
         header: Option<Header>,
+        world_packed: Option<Arc<crate::shared::packed::Layout>>,
         prior_readable: bool,
     ) -> Result<()> {
         self.stats.progress += 1;
@@ -2727,6 +2755,7 @@ impl DiskStore {
             if let Some(header) = header {
                 node.location.header = header;
             }
+            node.location.world_packed = world_packed;
             if node.location.header.replicated() {
                 self.stats.packed_records[1] += 1;
             } else {
@@ -3187,6 +3216,7 @@ impl DiskStore {
         self.stats.progress += 1;
         match event {
             TransportEvent::Stored { id, result, header } => {
+                let world_packed = self.transport.take_world_packed(id);
                 if self.outbound.contains_key(&id)
                     && result.as_ref().err().is_some_and(|e| {
                         e.carried().is_some_and(|e| e.is::<disk::ReplicaMismatch>())
@@ -3194,10 +3224,10 @@ impl DiskStore {
                 {
                     self.stats.abandoned_stores += 1;
                 }
-                self.finish_outbound(id, result, header.map(|h| *h), true, events);
+                self.finish_outbound(id, result, header.map(|h| *h), world_packed, true, events);
             }
             TransportEvent::StoreInvalidated { id, error } => {
-                self.finish_outbound(id, Err(error), None, false, events);
+                self.finish_outbound(id, Err(error), None, None, false, events);
             }
             TransportEvent::Fetched { id, result } => {
                 let Some(job) = self.inbound.remove(&id) else {
@@ -3267,6 +3297,7 @@ impl DiskStore {
         id: JobId,
         result: Result<u64>,
         header: Option<Header>,
+        world_packed: Option<Arc<crate::shared::packed::Layout>>,
         prior_readable: bool,
         events: &mut Vec<StoreEvent>,
     ) {
@@ -3277,7 +3308,13 @@ impl DiskStore {
             self.outbound_rate.observe(*bytes, job.started.elapsed());
         }
         let pressure = result.as_ref().err().is_some_and(Error::no_space);
-        let result = match self.finish_record(job.key, result.clone(), header, prior_readable) {
+        let result = match self.finish_record(
+            job.key,
+            result.clone(),
+            header,
+            world_packed,
+            prior_readable,
+        ) {
             Ok(()) => result,
             Err(error) => Err(error),
         };

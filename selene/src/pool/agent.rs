@@ -89,6 +89,32 @@ pub trait RankRecords: Send + 'static {
         row: bool,
         dst: &mut [u8],
     ) -> Result<Checksums>;
+
+    /// This rank's packed v4 (or literal-fallback) bytes for record-relative pages
+    /// `first_page..first_page + pages` (and row when `row`) of `key`, returning bytes written.
+    fn read_packed(
+        &mut self,
+        _key: PrefixKey,
+        _first_page: u32,
+        _pages: u32,
+        _row: bool,
+        _dst: &mut [u8],
+    ) -> Result<usize> {
+        Err(Error::new("rank records do not carry packed records"))
+    }
+
+    /// The same for a put: this rank's packed bytes for chain-relative pages `first_page..`
+    /// ending at `key`, returning bytes written.
+    fn fill_packed(
+        &mut self,
+        _key: PrefixKey,
+        _first_page: u32,
+        _pages: u32,
+        _row: bool,
+        _dst: &mut [u8],
+    ) -> Result<usize> {
+        Err(Error::new("rank records do not carry packed records"))
+    }
 }
 
 /// What a peer rank's agent is built from. The pool address and CA are this
@@ -935,26 +961,44 @@ impl Agent {
         }
         let mut coverage = Coverage::new(expected);
         coverage.channel_rank = (!shared).then_some(self.rank as u32);
-        let caps = crate::codec_copy::reader_caps_many(
-            &self.copier.lock().unwrap().codec_receive_profiles(),
-        );
-        if let Err(why) = coverage.select_packed(
-            &open.records,
-            (!out).then_some(&caps),
-            self.page_tokens,
-            || {
-                (0..self.world)
-                    .map(|r| {
-                        let s = self.layout.rank(r);
-                        crate::record::RankSizes {
-                            planes: vec![s.page_len],
-                            row_bytes: s.row_len,
-                        }
-                    })
-                    .collect()
-            },
-        ) {
-            return self.reject(xfer, why);
+        let rank_sizes = || {
+            (0..self.world)
+                .map(|r| {
+                    let s = self.layout.rank(r);
+                    crate::record::RankSizes {
+                        planes: vec![s.page_len],
+                        row_bytes: s.row_len,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        if out {
+            let any_packed = open.records.iter().any(|r| r.packed.is_some());
+            if any_packed {
+                let ranks = rank_sizes();
+                for (i, r) in open.records.iter().enumerate() {
+                    let Some(offer) = &r.packed else { continue };
+                    let first = (coverage.expected[i].key.consumed_tokens / self.page_tokens)
+                        .checked_sub(u64::from(r.pages));
+                    let layout = first.and_then(|first| {
+                        crate::shared::packed::Layout::new(offer.clone(), &ranks, first, r.pages)
+                            .ok()
+                    });
+                    let Some(layout) = layout.filter(|l| r.row == (l.row_bytes() != 0)) else {
+                        return self.reject(xfer, "invalid packed selection");
+                    };
+                    coverage.set_packed_layout(i, layout);
+                }
+            }
+        } else {
+            let caps = crate::codec_copy::reader_caps_many(
+                &self.copier.lock().unwrap().codec_receive_profiles(),
+            );
+            if let Err(why) =
+                coverage.select_packed(&open.records, Some(&caps), self.page_tokens, rank_sizes)
+            {
+                return self.reject(xfer, why);
+            }
         }
         let mut run = Xfer {
             host: open.host,
@@ -1033,9 +1077,16 @@ impl Agent {
         let (count, row) = (spec.page_count as usize, spec.row);
         let rank = self.rank;
         if let Some(manifest) = &spec.packed {
-            let bytes = region.bytes(spec.offset, spec.length).expect("checked");
-            let jobs = run.packed_jobs(&spec, manifest, bytes, dest, rank, None);
-            return self.queue(xfer, spec.index, jobs);
+            if !run.out {
+                let bytes = region.bytes(spec.offset, spec.length).expect("checked");
+                let jobs = run.packed_jobs(&spec, manifest, bytes, dest, rank, None);
+                return self.queue(xfer, spec.index, jobs);
+            }
+            if run.host {
+                let record = spec.record as usize;
+                return self.read_window(xfer, spec, record, base, None);
+            }
+            return self.fail(xfer, "GPU exports cannot carry packed windows".into());
         }
         if !run.out {
             // Verify this rank's slices against the transfer checksums before copying.
@@ -1121,6 +1172,8 @@ impl Agent {
             .expect("host transfer has records")
             .clone();
         let scatter = slot.is_none().then(|| (self.layout.clone(), self.rank));
+        let packed = spec.packed.clone();
+        let rank = self.rank as u32;
         let job = FillJob {
             owner: FillOwner::Export(xfer),
             window: spec.index,
@@ -1130,6 +1183,35 @@ impl Agent {
                     std::slice::from_raw_parts_mut(address as *mut u8, spec.length as usize)
                 };
                 let mut records = records.lock().unwrap();
+                if let Some(manifest) = packed {
+                    let mut read_packed = |bytes: &mut [u8]| {
+                        let expected = bytes.len();
+                        let written = if put {
+                            records.fill_packed(key, first, spec.page_count, spec.row, bytes)?
+                        } else {
+                            records.read_packed(key, first, spec.page_count, spec.row, bytes)?
+                        };
+                        if written != expected {
+                            return Err(Error::new(format!(
+                                "packed rank read wrote {written} bytes, expected {expected}"
+                            )));
+                        }
+                        Ok(())
+                    };
+                    if scatter.is_some() {
+                        let rank_bytes =
+                            crate::shared::packed::rank_window_bytes(&manifest, rank) as usize;
+                        let mut slice = vec![0u8; rank_bytes];
+                        read_packed(&mut slice)?;
+                        crate::shared::packed::scatter_rank_units(&manifest, rank, dst, &slice)?;
+                    } else {
+                        read_packed(dst)?;
+                    }
+                    return Ok(Checksums {
+                        pages: Vec::new(),
+                        row: None,
+                    });
+                }
                 let mut read = |bytes: &mut [u8]| {
                     if put {
                         records.fill(key, first, spec.page_count, spec.row, bytes)
@@ -1370,7 +1452,7 @@ impl Agent {
         if run.shared || !run.out || run.cancelled || run.failed.is_some() {
             return self.release_slot(slot);
         }
-        let spec = wire::WindowSpec {
+        let mut spec = wire::WindowSpec {
             packed: None,
             index: shape.index,
             region: wire::Region::Staging as i32,
@@ -1381,6 +1463,9 @@ impl Agent {
             page_count: shape.page_count,
             row: shape.row,
         };
+        if let Some(units) = run.coverage.pinned_units(&spec) {
+            spec.packed = Some(wire::PackedWindow { units });
+        }
         let dest = match run.coverage.accept(&spec, mine.page_len, mine.row_len) {
             Ok(dest) => dest as usize,
             Err(why) => {

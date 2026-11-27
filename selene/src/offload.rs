@@ -90,18 +90,6 @@ impl PrefixCacheOffload {
         Ok(())
     }
 
-    /// Reject unsupported multi-host (`--rank`) + pool + compression combinations.
-    /// Called both during core selection (for fast startup failure) and during
-    /// offload store preparation (for direct callers).
-    pub fn validate_topology(&self, multi_host: bool) -> Result<()> {
-        if multi_host && self.pool.is_some() && self.compression != KvCompression::Off {
-            return Err(
-                "multi-host --rank serving does not support --lossless-kv-compression with --prefix-cache-pool; use --lossless-kv-compression off with a pool or local --prefix-cache-disk without a pool".into(),
-            );
-        }
-        Ok(())
-    }
-
     pub fn enabled(&self) -> bool {
         self.memory_bytes.unwrap_or(0) != 0
             || (self.disk.is_some() && self.disk_limit != Some(0))
@@ -264,6 +252,8 @@ pub struct Prepared {
     pub warm_bytes: u64,
     rank_process: bool,
     pub scanned: Vec<record::Scanned>,
+    /// World-wide packed v4 layouts assembled across ranks during sharded startup agreement.
+    pub world_packed: std::collections::HashMap<crate::PrefixKey, std::sync::Arc<crate::shared::packed::Layout>>,
     pub directory_lock: Option<record::DirectoryLock>,
     /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
     /// separate processes; see [`shard`].
@@ -509,7 +499,6 @@ pub fn prepare_with_inputs(
     if shard.is_some() && memory_bytes != 0 {
         return Err("a multi-host core keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
     }
-    options.validate_topology(shard.is_some())?;
     let mut notes = Vec::new();
     let directory = match options
         .disk
@@ -618,6 +607,7 @@ pub fn prepare_with_inputs(
         warm_bytes: checkpoint_memory,
         rank_process: shard.is_some(),
         scanned,
+        world_packed: std::collections::HashMap::new(),
         directory_lock,
         shards: Vec::new(),
         pool: None,
@@ -656,6 +646,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
         warm_bytes,
         rank_process: _,
         scanned,
+        world_packed,
         directory_lock,
         shards,
         pool,
@@ -704,6 +695,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
                 scanned,
                 transport,
             )?;
+            store.set_world_packed(world_packed);
             store.index_mut().max_age = max_age;
             store.share_budget(disk_budget.clone());
             Ok::<_, crate::Error>(store)

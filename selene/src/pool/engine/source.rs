@@ -28,11 +28,11 @@ use super::{
         shared::{ExportRequest, PoolEvent},
         wire::{self, client_message::M as Out},
     },
-    Engine, Owner,
     coverage::Coverage,
     hostfill::FillOwner,
     outbound::Outbound,
     requester::ExpectedRecord,
+    Engine, Owner,
 };
 
 enum Phase {
@@ -249,11 +249,6 @@ impl Engine {
                 None => u64::from(r.pages) * page_bytes + if r.row { row_bytes } else { 0 },
             })
             .sum();
-        // Multi-process rank agents (`self.ranks.is_some()`) hold single-rank packed records
-        // rather than world-wide offers; CLI startup rejects `--rank` + `--prefix-cache-pool` +
-        // compression in `PrefixCacheOffload::validate_topology`, and direct `PoolClient` callers
-        // are still guarded below by `shared::packed::Layout::new`'s world-wide rank-coverage
-        // check (`ClaimReason::ChainGap`).
         let valid = !expected.is_empty() && row == run.want_row;
         // A GPU export always has its staging reserved; a host export with none
         // reserved streams.
@@ -277,7 +272,9 @@ impl Engine {
             }
             return release(self, pin);
         }
+        let via_channel = run.reference.is_some();
         let mut coverage = Coverage::new(expected.clone());
+        coverage.channel_rank = (via_channel && self.ranks.is_some()).then_some(0);
         if any_packed {
             let geometry = &self.st.scope.geometry;
             let ranks: Vec<_> = geometry
@@ -290,8 +287,8 @@ impl Engine {
                 .collect();
             for (i, (r, offer)) in expected.iter().zip(&packed).enumerate() {
                 let Some(offer) = offer else { continue };
-                let first = (r.key.consumed_tokens / geometry.page_tokens)
-                    .checked_sub(u64::from(r.pages));
+                let first =
+                    (r.key.consumed_tokens / geometry.page_tokens).checked_sub(u64::from(r.pages));
                 let layout = first.and_then(|first| {
                     crate::shared::packed::Layout::new(offer.clone(), &ranks, first, r.pages).ok()
                 });
@@ -528,7 +525,6 @@ impl Engine {
             Pin::Host(pin) => {
                 let pin = pin.clone();
                 let is_packed = spec.packed.is_some();
-                let expected_len = spec.length as usize;
                 run.windows.insert(spec.index, spec.clone());
                 let span = HostWindow {
                     record: spec.record,
@@ -544,6 +540,7 @@ impl Engine {
                     self.ranks.as_ref(),
                     Box::new(move |dst| {
                         if is_packed {
+                            let expected_len = dst.len();
                             let written = pin.lock().unwrap().read_packed(&span, dst)?;
                             if written != expected_len {
                                 return Err(crate::Error::new(format!(

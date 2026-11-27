@@ -30,7 +30,7 @@ services:
       - --tls-key
       - /tls/server-key.pem
       - --metrics
-      - 127.0.0.1:9108
+      - 0.0.0.0:9108
     volumes:
       - /run/selene:/run/selene
       - /dev/shm/selene:/dev/shm/selene
@@ -39,6 +39,7 @@ services:
     ports:
       - "9200:9200"
       - "9201:9201"
+      - "127.0.0.1:9108:9108"
     # The disk threads need io_uring, which Docker's default seccomp profile blocks. This
     # profile is Docker's default plus io_uring_setup, io_uring_enter and io_uring_register.
     security_opt: ["seccomp=./seccomp-io-uring.json"]

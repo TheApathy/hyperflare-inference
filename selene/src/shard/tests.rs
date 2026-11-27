@@ -133,6 +133,7 @@ use std::net::TcpListener;
                 path: Some(third.clone()),
                 cleanup: None,
                 header: None,
+                offers: vec![None; 2],
                 started: Instant::now(),
             },
         );
@@ -161,6 +162,7 @@ use std::net::TcpListener;
                 path: Some(fourth.clone()),
                 cleanup: None,
                 header: None,
+                offers: vec![None; 2],
                 started: Instant::now(),
             },
         );
@@ -197,6 +199,7 @@ use std::net::TcpListener;
                 path: Some(sixth.clone()),
                 cleanup: None,
                 header: None,
+                offers: vec![None; 2],
                 started: Instant::now(),
             },
         );
@@ -236,6 +239,7 @@ use std::net::TcpListener;
                 path: Some(seventh.clone()),
                 cleanup: None,
                 header: None,
+                offers: vec![None; 2],
                 started: Instant::now(),
             },
         );
@@ -444,6 +448,7 @@ use std::net::TcpListener;
                 path: None,
                 cleanup: None,
                 header: None,
+                offers: vec![None; 2],
                 started: Instant::now() - JOB_TIMEOUT - Duration::from_secs(1),
             },
         );
@@ -596,7 +601,8 @@ use std::net::TcpListener;
         };
         let (kind, id, result) = Kind::of(&event);
         let frame = encode_event(kind, id, &result);
-        let (kind, id, result) = decode_event(&frame[5..]).unwrap();
+        let (kind, id, result, offer) = decode_event(&frame[5..]).unwrap();
+        assert!(offer.is_none());
         assert!(matches!(
             kind.event(id, result),
             TransportEvent::StoreInvalidated { id: JobId(11), .. }
@@ -610,7 +616,8 @@ use std::net::TcpListener;
             )),
         ] {
             let frame = encode_event(Kind::Fetched, JobId(9), &result);
-            let (kind, id, decoded) = decode_event(&frame[5..]).unwrap();
+            let (kind, id, decoded, offer) = decode_event(&frame[5..]).unwrap();
+            assert!(offer.is_none());
             assert_eq!((kind, id), (Kind::Fetched, JobId(9)));
             match (result, decoded) {
                 (Ok(a), Ok(b)) => assert_eq!(a, b),
@@ -651,7 +658,8 @@ fn record_read_failure_survives_rank_events_and_aggregation() {
     .into_iter()
     .map(|result| {
         let frame = encode_event(Kind::Fetched, JobId(9), &result);
-        let (kind, id, result) = decode_event(&frame[5..]).unwrap();
+        let (kind, id, result, offer) = decode_event(&frame[5..]).unwrap();
+        assert!(offer.is_none());
         assert_eq!((kind, id), (Kind::Fetched, JobId(9)));
         Some(result)
     })
@@ -665,6 +673,7 @@ fn record_read_failure_survives_rank_events_and_aggregation() {
             path: None,
             cleanup: None,
             header: None,
+            offers: vec![None; 2],
             started: Instant::now(),
         },
     );
@@ -684,7 +693,8 @@ fn space_pressure_survives_rank_events_and_aggregation() {
             JobId(7),
             &Err(Error::carrying(std::io::Error::from(kind))),
         );
-        let (kind, id, result) = decode_event(&frame[5..]).unwrap();
+        let (kind, id, result, offer) = decode_event(&frame[5..]).unwrap();
+        assert!(offer.is_none());
         assert!(result.as_ref().unwrap_err().no_space());
         let mut transport = Sharded::new(staged(), Vec::new()).unwrap();
         transport.finish(
@@ -695,6 +705,7 @@ fn space_pressure_survives_rank_events_and_aggregation() {
                 path: None,
                 cleanup: None,
                 header: None,
+                offers: vec![None; 1],
                 started: Instant::now(),
             },
         );
@@ -703,4 +714,152 @@ fn space_pressure_survives_rank_events_and_aggregation() {
         );
         transport.close().unwrap();
     }
+}
+
+#[test]
+fn packed_shard_summary_agreement_and_event_round_trip() {
+    use crate::shared::{
+        packed,
+        wire::{
+            PackedOffer, PackedUnit,
+            packed_unit::{Kind as UnitKind, Representation},
+        },
+    };
+    let dir0 = directory("packed-agree-r0");
+    let dir1 = directory("packed-agree-r1");
+    let geom = vec![geometry(64, &[("kv", 4096)], 4096)];
+
+    let root_key = key(128, 1);
+    let child_key = key(256, 2);
+    let orphan_parent = key(128, 9);
+    let orphan_child = key(256, 10);
+
+    let write_v4 =
+        |dir: &Path, k: PrefixKey, parent: Option<PrefixKey>, first_page: u64, tag: u8| {
+            let p0 = vec![tag; 24];
+            let p1 = vec![tag.wrapping_add(1); 32];
+            let row = vec![tag.wrapping_add(2); 20];
+            let make_pkt = |kind: UnitKind, logical_index: u64, data: &[u8]| PackedUnit {
+                kind: kind as i32,
+                logical_index,
+                stored_rank: 0,
+                representation: Representation::Packet as i32,
+                profile: vec![0x77; 32],
+                original_length: 4096,
+                stored_length: data.len() as u64,
+                replicas: Vec::new(),
+                stored_crc: packed::crc32(data),
+                original_crc: u32::from(tag) + logical_index as u32,
+                raw_xxh3: 0,
+            };
+            let offer = PackedOffer {
+                first_page,
+                units: vec![
+                    make_pkt(UnitKind::Page, first_page, &p0),
+                    make_pkt(UnitKind::Page, first_page + 1, &p1),
+                    make_pkt(UnitKind::Row, 0, &row),
+                ],
+            };
+            let header = Header::new(
+                &geom,
+                [1; 32],
+                [2; 16],
+                k,
+                parent,
+                [0; 16],
+                2,
+                UNIX_EPOCH + Duration::from_secs(1_000_000),
+            )
+            .unwrap()
+            .with_packed(offer)
+            .unwrap();
+            let mut bytes = header.packed_metadata().unwrap();
+            bytes.extend_from_slice(&p0);
+            bytes.extend_from_slice(&p1);
+            bytes.extend_from_slice(&row);
+            let path = dir.join(record::file_name(&k));
+            std::fs::write(&path, &bytes).unwrap();
+            record::Scanned {
+                path,
+                header,
+                bytes: bytes.len() as u64,
+                modified: UNIX_EPOCH + Duration::from_secs(1_000_000),
+                row: true,
+            }
+        };
+
+    let write_v3 = |dir: &Path, k: PrefixKey, parent: Option<PrefixKey>, tag: u8| {
+        let mut header = Header::new(
+            &geom,
+            [1; 32],
+            [2; 16],
+            k,
+            parent,
+            [0; 16],
+            2,
+            UNIX_EPOCH + Duration::from_secs(1_000_000),
+        )
+        .unwrap();
+        let row_bytes = vec![tag.wrapping_add(2); 4096];
+        header.row_checksum = record::checksum(&row_bytes);
+        let mut bytes = vec![0u8; header.length_with_row() as usize];
+        bytes[..HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+        for page in 0..2usize {
+            let at = header.page_segment as usize + page * 4096;
+            bytes[at..at + 4096].fill(tag.wrapping_add(page as u8));
+            let sum = record::checksum(&bytes[at..at + 4096]);
+            let csum_at = header.checksum_segment() as usize + page * 8;
+            bytes[csum_at..csum_at + 8].copy_from_slice(&sum.to_le_bytes());
+        }
+        bytes[header.row_segment as usize..].copy_from_slice(&row_bytes);
+        let path = dir.join(record::file_name(&k));
+        std::fs::write(&path, &bytes).unwrap();
+        record::Scanned {
+            path,
+            header,
+            bytes: bytes.len() as u64,
+            modified: UNIX_EPOCH + Duration::from_secs(1_000_000),
+            row: true,
+        }
+    };
+
+    let zero = vec![
+        write_v4(&dir0, root_key, None, 0, 10),
+        write_v4(&dir0, child_key, Some(root_key), 2, 20),
+        write_v4(&dir0, orphan_parent, None, 0, 30),
+        write_v4(&dir0, orphan_child, Some(orphan_parent), 2, 40),
+    ];
+    let one = vec![
+        write_v3(&dir1, root_key, None, 50),
+        write_v4(&dir1, child_key, Some(root_key), 2, 60),
+        write_v4(&dir1, orphan_child, Some(orphan_parent), 2, 70),
+    ];
+
+    let frame = summary_with_literals(&one, true).unwrap();
+    let peer_summary = decode_summary_with_packed(&frame[5..]).unwrap();
+    let (agreed, world_packed) = agree_with_packed(&zero, &[peer_summary]).unwrap();
+    assert_eq!(agreed, HashMap::from([(root_key, true), (child_key, true)]));
+    assert!(world_packed.contains_key(&root_key));
+    assert!(world_packed.contains_key(&child_key));
+    assert!(!world_packed.contains_key(&orphan_child));
+    let root_layout = &world_packed[&root_key];
+    assert_eq!(root_layout.offer().units.len(), 6);
+    assert_eq!(
+        root_layout.offer().units[0].representation,
+        Representation::Packet as i32
+    );
+    assert_eq!(
+        root_layout.offer().units[1].representation,
+        Representation::Literal as i32
+    );
+
+    let offer = zero[0].header.packed.as_ref().unwrap().offer().clone();
+    let encoded = encode_event_with_offer(Kind::Stored, JobId(42), &Ok(1234), Some(&offer));
+    let (kind, id, result, decoded_offer) = decode_event(&encoded[5..]).unwrap();
+    assert_eq!((kind, id), (Kind::Stored, JobId(42)));
+    assert_eq!(result.unwrap(), 1234);
+    assert_eq!(decoded_offer, Some(offer));
+
+    let _ = std::fs::remove_dir_all(dir0);
+    let _ = std::fs::remove_dir_all(dir1);
 }

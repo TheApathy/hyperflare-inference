@@ -69,7 +69,6 @@ impl LoadOptions {
     pub(super) fn select(&self, cores: &mut [Core], config: &mut Value) -> Result<usize> {
         self.prefix_cache
             .validate_compression()
-            .and_then(|()| self.prefix_cache.validate_topology(self.cluster_rank.is_some()))
             .map_err(|error| invalid(error.to_string()))?;
         if self.mtp_verification_token_budget.is_some()
             && self.mtp_max_verification_token_budget.is_some()
