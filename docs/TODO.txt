@@ -13,10 +13,6 @@
     legacy review still requires the files that VerifiedCore::open reads.
     Verify a legacy acquisition with an unknown key and missing companions.
 
-[ ] Prevent healthy TP forward compilation from exhausting the two-hour Gloo
-    timeout in ForwardCache._prepare_ranks when idle ranks gather outcomes.
-    Preserve compiler failure and dead-peer detection while waiting for work.
-
 [ ] Restore loading and serving for cores with separate proposal and verification
     graphs, whose operation identifiers 10, 11, and 13 are reserved in
     helios/proto/runtime_core.proto. Validate their original captured graphs

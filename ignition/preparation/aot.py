@@ -12,7 +12,9 @@ import os
 import pickle
 import sys
 import tempfile
+import time
 import zlib
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, wait
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
@@ -615,13 +617,21 @@ class BoundForward:
             release_unused()
 
 
-def _completed(pending):
+# Interval between rank compilation status exchanges so healthy builds do not exhaust the Gloo collective timeout.
+_COMPILE_HEARTBEAT_SECONDS = 30.0
+
+
+def _completed(pending, *, timeout=None):
+    deadline = None if timeout is None else time.monotonic() + timeout
     while True:
         for index, item in enumerate(pending):
             future = item[-2].pending
             if future is None or future.done():
                 return pending.pop(index)
-        wait([item[-2].pending for item in pending], return_when=FIRST_COMPLETED)
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        done, _ = wait([item[-2].pending for item in pending], timeout=remaining, return_when=FIRST_COMPLETED)
+        if not done and deadline is not None and time.monotonic() >= deadline:
+            return None
 
 
 def allocation_order(names, sizes, coordinator=None):
@@ -1004,63 +1014,132 @@ class ForwardCache:
             mailed = [None] * len(ranks)
             dist.all_gather_object(mailed, sent, group=group)
             borrowed = [job for jobs in mailed for borrower, job in jobs if borrower == share]
+            heartbeat_seconds = _COMPILE_HEARTBEAT_SECONDS
+            if heartbeat_seconds <= 0:
+                raise ValueError("forward compilation heartbeat interval must be positive")
+            pending = []
+            queue = deque()
+            local_done = False
+            compiler_closed = False
+
+            def close_compiler(*, cancel_pending=False):
+                nonlocal compiler_closed, outcome
+                if cancel_pending:
+                    for _, _, item_bound, _ in pending:
+                        if item_bound.pending is not None:
+                            item_bound.pending.cancel()
+                    pending.clear()
+                if compiler_closed:
+                    return
+                compiler_closed = True
+                try:
+                    compiler_scope.close()
+                except Exception as failure:
+                    outcome = None, outcome[1] or f"{type(failure).__name__}: {failure}"
+
+            def finish_item(name, variant, item_bound, path):
+                if item_bound.pending is not None:
+                    item_bound.pending.result()
+                elif materialize is None:
+                    # Restored and bound to this rank's own forward already.
+                    selected[name] = item_bound
+                if name is not None:
+                    # Each forward's path, and whether this launch compiled it rather than restoring it.
+                    paths[name, variant] = str(path), item_bound.pending is not None
+                    stage.update(advance=1)
+
             try:
                 if error is not None:
                     raise RuntimeError(error)
-                pending = []
-
-                def finish():
-                    name, variant, bound, path = _completed(pending)
-                    if bound.pending is not None:
-                        bound.pending.result()
-                    elif materialize is None:
-                        # Restored and bound to this rank's own forward already.
-                        selected[name] = bound
-                    if name is not None:
-                        # Each forward's path, and whether this launch compiled it rather than restoring it.
-                        paths[name, variant] = str(path), bound.pending is not None
-                        stage.update(advance=1)
-
                 for index, (name, variant, forward) in enumerate(work):
                     if (name, variant) in lent:
                         continue
                     if index in restored:
-                        bound, path = restored[index]
+                        item_bound, path = restored[index]
+                        finish_item(name, variant, item_bound, path)
                     else:
-                        path = self._path(forward, name=f"{name}.{variant}", signature=signatures[name])
-                        bound = BoundForward(None, forward, False, compiler.submit(forward, path))
-                    pending.append((name, variant, bound, path))
-                    if compiler is not None and len(pending) >= compiler.workers:
-                        finish()
+                        queue.append(("owned", (name, variant, forward)))
                 for job in borrowed:
-                    with open(job, 'rb') as file:
-                        payload, path = pickle.load(file)
-                    os.unlink(job)
-                    future = compiler.submit_payload(payload, Path(path))
-                    pending.append((None, None, BoundForward(None, None, False, future), path))
-                    if len(pending) >= compiler.workers:
-                        finish()
-                while pending:
-                    finish()
-                outcome = paths, None
+                    queue.append(("borrowed", job))
             except Exception as failure:
                 outcome = None, f"{type(failure).__name__}: {failure}"
+                local_done = True
+                close_compiler(cancel_pending=True)
+
+            failures = []
+            outcomes = None
             try:
-                compiler_scope.close()
-            except Exception as failure:
-                outcome = None, outcome[1] or f"{type(failure).__name__}: {failure}"
-            outcomes = [None] * len(ranks)
-            dist.all_gather_object(outcomes, outcome, group=group)
-            for _, job in sent:
-                Path(job).unlink(missing_ok=True)
+                while True:
+                    if not local_done:
+                        deadline = time.monotonic() + heartbeat_seconds
+                        try:
+                            while queue or pending:
+                                while queue and len(pending) < compiler.workers:
+                                    if pending and time.monotonic() >= deadline:
+                                        break
+                                    kind, item = queue.popleft()
+                                    if kind == "owned":
+                                        name, variant, forward = item
+                                        path = self._path(forward, name=f"{name}.{variant}",
+                                                          signature=signatures[name])
+                                        item_bound = BoundForward(None, forward, False, compiler.submit(forward, path))
+                                        pending.append((name, variant, item_bound, path))
+                                    else:
+                                        with open(item, 'rb') as file:
+                                            payload, path = pickle.load(file)
+                                        os.unlink(item)
+                                        future = compiler.submit_payload(payload, Path(path))
+                                        pending.append((None, None, BoundForward(None, None, False, future), path))
+                                remaining = max(0.0, deadline - time.monotonic())
+                                completed = _completed(pending, timeout=remaining)
+                                if completed is None:
+                                    break
+                                finish_item(*completed)
+                                completed = None
+                                if (queue or pending) and time.monotonic() >= deadline:
+                                    break
+                            if not queue and not pending:
+                                outcome = paths, None
+                                local_done = True
+                        except Exception as failure:
+                            outcome = None, f"{type(failure).__name__}: {failure}"
+                            local_done = True
+                        if local_done:
+                            close_compiler(cancel_pending=outcome[1] is not None)
+                    # Exchange liveness and failure state at bounded intervals so idle ranks do not
+                    # wait through an entire compilation catalog inside one Gloo collective.
+                    status = ("compiling", None) if not local_done else (
+                        ("failed", outcome[1]) if outcome[1] is not None else ("done", None)
+                    )
+                    statuses = [None] * len(ranks)
+                    dist.all_gather_object(statuses, status, group=group)
+                    failures = [(rank, failure) for rank, (state, failure) in zip(ranks, statuses, strict=True)
+                                if state == "failed"]
+                    if failures:
+                        close_compiler(cancel_pending=True)
+                        break
+                    if all(state == "done" for state, _ in statuses):
+                        outcomes = [None] * len(ranks)
+                        dist.all_gather_object(outcomes, outcome, group=group)
+                        break
+            finally:
+                for _, _, item_bound, _ in pending:
+                    if item_bound.pending is not None:
+                        item_bound.pending.cancel()
+                pending.clear()
+                for _, job in sent:
+                    Path(job).unlink(missing_ok=True)
             # Raise inside the phase so it ends as failed rather than complete. Every rank holds the same
-            # outcomes, so every rank raises here and none skips a collective.
-            failures = [(index, failure) for index, (_, failure) in zip(ranks, outcomes) if failure is not None]
+            # status round, so every rank raises here and none skips a collective.
             if failures:
-                raise RuntimeError(f"forward compilation failed: {failures}")
+                failure = RuntimeError(f"forward compilation failed: {failures}")
+                if outcome[1] is not None and not any(rank == ranks[share] for rank, _ in failures):
+                    failure.add_note(f"local compiler cleanup failed: {outcome[1]}")
+                raise failure
             # Forwards lent to other ranks are complete once every rank reports.
             stage.update(advance=len(lent))
         restored.clear()
+        item_bound = None
         bound = None
         paths = {key: value for compiled, _ in outcomes for key, value in compiled.items()}
         # Ranks on one host compiled into its cache directory; only other hosts lack their shares.

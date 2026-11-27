@@ -456,3 +456,240 @@ def test_cached_catalog_releases_restoration_owners_before_rebinding(tmp_path, d
         process.join(timeout=60)
         assert process.exitcode == 0
     assert results == {rank: list("abcd") for rank in range(3)}
+
+
+def _heartbeat_rank(rank, store, root, outcome, mode, release=None):
+    from concurrent.futures import Future
+    from contextlib import nullcontext
+    from datetime import timedelta
+    import signal
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+
+    from ignition.preparation import aot, compile_pool
+
+    messages = []
+    pool_closed = False
+    compiling_heartbeats = 0
+    started_at = time.monotonic()
+    try:
+        stop_worker = threading.Event()
+
+        class HeartbeatPool(_Pool):
+            def __exit__(self, *args):
+                nonlocal pool_closed
+                pool_closed = True
+                stop_worker.set()
+
+            def submit_payload(self, payload, path):
+                from ignition.preparation.forward_metadata import loads
+
+                forward = loads(payload)
+                if mode == "slow_healthy" and rank == 0:
+                    future = Future()
+
+                    def finish():
+                        time.sleep(1.8)
+                        Path(path).write_text(f"{forward.compilation_variant} compiled by rank {rank}")
+                        future.set_result(None)
+
+                    threading.Thread(target=finish, daemon=True).start()
+                    return future
+                if mode == "peer_failure":
+                    future = Future()
+                    if rank == 0:
+                        def slow():
+                            if not stop_worker.wait(10.0):
+                                Path(path).write_text(f"{forward.compilation_variant} compiled by rank {rank}")
+                                future.set_result(None)
+
+                        threading.Thread(target=slow, daemon=True).start()
+                        return future
+
+                    def fail():
+                        time.sleep(0.08)
+                        future.set_exception(RuntimeError("boom on rank 1"))
+
+                    threading.Thread(target=fail, daemon=True).start()
+                    return future
+                if mode == "killed_peer" and rank == 1:
+                    os.kill(os.getpid(), signal.SIGKILL)
+                if mode == "stalled_peer" and rank == 1:
+                    release.wait(20.0)
+                    future = Future()
+                    future.set_exception(RuntimeError("stalled peer released"))
+                    return future
+                return super().submit_payload(payload, path)
+
+        compile_pool.CompilePool = HeartbeatPool
+        _replace_gpu_preparation()
+        if mode in ("killed_peer", "stalled_peer"):
+            compile_pool.compiler_resources = lambda *args, **kwargs: compile_pool.CompilerResources(
+                int(rank == 1), 128 << 30, 16, 32 << 30, 8 << 30)
+        aot._COMPILE_HEARTBEAT_SECONDS = 0.08 if mode == "slow_healthy" else 0.05
+        aot.ForwardCache._load = lambda self, forward, path, required=False, before_run=None: aot.BoundForward(
+            _Artifact(lambda owner: None), forward, True)
+        aot.ForwardCache._allocation_sizes = lambda self, path: ()
+        timeout = timedelta(seconds=1.0) if mode in ("slow_healthy", "stalled_peer") else timedelta(seconds=15)
+        dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=2, timeout=timeout)
+
+        real_all_gather_object = dist.all_gather_object
+
+        def tracked_all_gather_object(object_list, obj, group=None):
+            nonlocal compiling_heartbeats
+            real_all_gather_object(object_list, obj, group=group)
+            if (isinstance(obj, tuple) and len(obj) == 2 and obj[0] in ("compiling", "done", "failed")
+                    and any(isinstance(item, tuple) and item[0] == "compiling" for item in object_list)):
+                compiling_heartbeats += 1
+
+        dist.all_gather_object = tracked_all_gather_object
+
+        cache = aot.ForwardCache.__new__(aot.ForwardCache)
+        cache.root, cache.device, cache.headroom_bytes, cache.options = root, "cpu", 0, aot.MappingProxyType({})
+        cache.compile_workers = None
+        cache.lock_gpu_clocks = False
+        variant = "sample" if rank == 0 else "consume"
+        functions = {"a": _Forward(variant)}
+        signatures = {"a": "a"}
+        if mode == "slow_healthy" and rank == 1:
+            cache._path(functions["a"], name="a.consume", signature="a").write_text("cached")
+        elif mode in ("killed_peer", "stalled_peer") and rank == 0:
+            cache._path(functions["a"], name="a.sample", signature="a").write_text("cached")
+        dist.barrier()
+        started_at = time.monotonic()
+        coordinator = SimpleNamespace(
+            group=dist.group.WORLD, ranks=(0, 1), hosts=("host", "host"), spans_hosts=False,
+            local_ranks=2, barrier=lambda key, ranks: dist.monitored_barrier(group=dist.group.WORLD))
+        selected = cache._prepare_ranks(functions, signatures, coordinator, progress=messages.append,
+                                        materialize=lambda: None, warmup=nullcontext, before_run=None)
+        outcome.put((rank, ("ok", sorted(selected), time.monotonic() - started_at, compiling_heartbeats, pool_closed)))
+    except Exception:  # noqa: BLE001 - The parent inspects every rank's error and progress log.
+        import traceback
+
+        outcome.put((rank, ("error", traceback.format_exc(), time.monotonic() - started_at, messages, pool_closed)))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_prepare_ranks_heartbeats_keep_healthy_compilation_alive_past_gloo_timeout(tmp_path):
+    context = multiprocessing.get_context("fork")
+    root = tmp_path / "forwards"
+    root.mkdir()
+    outcome = context.Queue()
+    processes = [context.Process(target=_heartbeat_rank,
+                                 args=(rank, tmp_path / "store", root, outcome, "slow_healthy"))
+                 for rank in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        results = dict(outcome.get(timeout=30) for _ in processes)
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
+        for rank in (0, 1):
+            status, selected, elapsed, heartbeats, _ = results[rank]
+            assert status == "ok", results[rank]
+            assert selected == ["a"]
+            assert elapsed >= 1.5
+            assert heartbeats >= 5
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+
+
+def test_prepare_ranks_aborts_compiling_peer_promptly_on_compiler_failure(tmp_path):
+    context = multiprocessing.get_context("fork")
+    root = tmp_path / "forwards"
+    root.mkdir()
+    outcome = context.Queue()
+    processes = [context.Process(target=_heartbeat_rank,
+                                 args=(rank, tmp_path / "store", root, outcome, "peer_failure"))
+                 for rank in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        results = dict(outcome.get(timeout=15) for _ in processes)
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
+        for rank in (0, 1):
+            status, trace, elapsed, messages, pool_closed = results[rank]
+            assert status == "error"
+            assert "forward compilation failed:" in trace
+            assert "boom on rank 1" in trace
+            assert elapsed < 3.0
+            assert pool_closed
+            assert any(message.startswith("Compile model forwards failed in") for message in messages)
+            assert not any(message.startswith("Compile model forwards complete in") for message in messages)
+        assert not list(root.rglob("*.forward"))
+        assert not list(root.rglob("*.tmp"))
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+
+
+def test_prepare_ranks_detects_killed_peer_while_waiting_for_compilation(tmp_path):
+    import signal
+
+    context = multiprocessing.get_context("fork")
+    root = tmp_path / "forwards"
+    root.mkdir()
+    outcome = context.Queue()
+    processes = [context.Process(target=_heartbeat_rank,
+                                 args=(rank, tmp_path / "store", root, outcome, "killed_peer"))
+                 for rank in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        rank, result = outcome.get(timeout=15)
+        processes[0].join(timeout=10)
+        processes[1].join(timeout=10)
+        assert rank == 0
+        assert processes[0].exitcode == 0
+        assert processes[1].exitcode == -signal.SIGKILL
+        status, trace, elapsed, messages, _ = result
+        assert status == "error"
+        assert "RuntimeError" in trace or "DistBackendError" in trace
+        assert elapsed < 5.0
+        assert any(message.startswith("Compile model forwards failed in") for message in messages)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+
+
+def test_prepare_ranks_times_out_when_peer_stalls_without_heartbeating(tmp_path):
+    context = multiprocessing.get_context("fork")
+    root = tmp_path / "forwards"
+    root.mkdir()
+    outcome = context.Queue()
+    release = context.Event()
+    processes = [context.Process(target=_heartbeat_rank,
+                                 args=(rank, tmp_path / "store", root, outcome, "stalled_peer", release))
+                 for rank in range(2)]
+    try:
+        for process in processes:
+            process.start()
+        rank, result = outcome.get(timeout=15)
+        assert rank == 0
+        status, trace, elapsed, messages, _ = result
+        assert status == "error"
+        assert "Timed out" in trace or "Timeout" in trace
+        assert elapsed < 6.0
+        assert any(message.startswith("Compile model forwards failed in") for message in messages)
+    finally:
+        release.set()
+        for process in processes:
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
