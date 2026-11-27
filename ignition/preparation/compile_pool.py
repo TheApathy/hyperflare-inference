@@ -176,7 +176,7 @@ class CompilePool:
 
     def __exit__(self, kind, value, traceback):
         if self.pool is not None:
-            if isinstance(self.pool, ProcessPoolExecutor):
+            if os.name == "nt" and isinstance(self.pool, ProcessPoolExecutor):
                 self.pool.shutdown(wait=True, cancel_futures=kind is not None)
             else:
                 self.pool.shutdown()
