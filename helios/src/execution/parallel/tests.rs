@@ -870,3 +870,329 @@ fn publish_completed_front_preserves_pending_frame_on_agreement_or_timing_reject
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].fence, Fence(2));
 }
+
+#[test]
+fn socket_partial_commit_dispatch_stops_at_failed_peer_and_preserves_prior_commits() {
+    for failed_peer in 0..=3 {
+        let mut peers = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..3 {
+            let (coord, rank) = crate::execution::rank_stream::test_pair().unwrap();
+            peers.push(Peer {
+                channel: Channel::new(coord).unwrap(),
+            });
+            receivers.push(Some(Channel::new(rank).unwrap()));
+        }
+        if failed_peer < 3 {
+            drop(receivers[failed_peer].take());
+        }
+        let result = dispatch_commit_peers(&mut peers, Fence(7), 1);
+        if failed_peer < 3 {
+            assert!(
+                result.is_err(),
+                "partial commit dispatch must fail when peer {failed_peer} is disconnected"
+            );
+        } else {
+            result.unwrap();
+        }
+        for (index, receiver) in receivers.iter_mut().enumerate() {
+            let Some(channel) = receiver.as_mut() else {
+                continue;
+            };
+            channel.nonblocking(true).unwrap();
+            if index < failed_peer {
+                let (tag, bytes) = channel.wait(false).unwrap();
+                assert_eq!(tag, COMMIT);
+                assert_eq!(read_identity(&bytes).unwrap(), (Fence(7), 1));
+                channel.nonblocking(true).unwrap();
+                assert!(channel.poll().unwrap().is_none());
+            } else {
+                assert!(
+                    channel.poll().unwrap().is_none(),
+                    "peer {index} must not receive COMMIT after failed peer {failed_peer}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn socket_startup_drain_withholds_release_unless_every_peer_and_local_drain() {
+    // Case 1: Peer 0 replies DRAINED while peer 1 disconnects -> neither peer receives RELEASE.
+    {
+        let (c0, r0) = crate::execution::rank_stream::test_pair().unwrap();
+        let (c1, r1) = crate::execution::rank_stream::test_pair().unwrap();
+        let mut peers = vec![
+            Peer {
+                channel: Channel::new(c0).unwrap(),
+            },
+            Peer {
+                channel: Channel::new(c1).unwrap(),
+            },
+        ];
+        let mut rank0 = Channel::new(r0).unwrap();
+        let mut rank1 = Channel::new(r1).unwrap();
+        let peer0_thread = std::thread::spawn(move || {
+            assert!(rank0.receive(DRAIN).unwrap().is_empty());
+            rank0.send(STARTED, &[]).unwrap();
+            rank0.send(DRAINED, &[]).unwrap();
+            // Coordinator must close without sending RELEASE because peer 1 failed to drain.
+            let err = rank0.receive(RELEASE).unwrap_err().to_string();
+            assert!(err.contains("disconnected"), "{err}");
+        });
+        let peer1_thread = std::thread::spawn(move || {
+            assert!(rank1.receive(DRAIN).unwrap().is_empty());
+            drop(rank1);
+        });
+        let peers_drained = drain_startup_peers(&mut peers);
+        assert!(!peers_drained);
+        release_and_shutdown_peers(&mut peers, peers_drained);
+        peer0_thread.join().unwrap();
+        peer1_thread.join().unwrap();
+    }
+
+    // Case 2: All peers drain, but local fails to drain -> RELEASE is withheld.
+    {
+        let (c0, r0) = crate::execution::rank_stream::test_pair().unwrap();
+        let mut peers = vec![Peer {
+            channel: Channel::new(c0).unwrap(),
+        }];
+        let mut rank0 = Channel::new(r0).unwrap();
+        let peer0_thread = std::thread::spawn(move || {
+            assert!(rank0.receive(DRAIN).unwrap().is_empty());
+            rank0.send(DRAINED, &[]).unwrap();
+            let err = rank0.receive(RELEASE).unwrap_err().to_string();
+            assert!(err.contains("disconnected"), "{err}");
+        });
+        let peers_drained = drain_startup_peers(&mut peers);
+        assert!(peers_drained);
+        release_and_shutdown_peers(&mut peers, false);
+        peer0_thread.join().unwrap();
+    }
+
+    // Case 3: Every peer and local drain -> every peer receives RELEASE.
+    {
+        let (c0, r0) = crate::execution::rank_stream::test_pair().unwrap();
+        let (c1, r1) = crate::execution::rank_stream::test_pair().unwrap();
+        let mut peers = vec![
+            Peer {
+                channel: Channel::new(c0).unwrap(),
+            },
+            Peer {
+                channel: Channel::new(c1).unwrap(),
+            },
+        ];
+        let mut rank0 = Channel::new(r0).unwrap();
+        let mut rank1 = Channel::new(r1).unwrap();
+        let t0 = std::thread::spawn(move || {
+            assert!(rank0.receive(DRAIN).unwrap().is_empty());
+            rank0.send(DRAINED, &[]).unwrap();
+            assert!(rank0.receive(RELEASE).unwrap().is_empty());
+        });
+        let t1 = std::thread::spawn(move || {
+            assert!(rank1.receive(DRAIN).unwrap().is_empty());
+            rank1.send(DRAINED, &[]).unwrap();
+            assert!(rank1.receive(RELEASE).unwrap().is_empty());
+        });
+        let peers_drained = drain_startup_peers(&mut peers);
+        assert!(peers_drained);
+        release_and_shutdown_peers(&mut peers, true);
+        t0.join().unwrap();
+        t1.join().unwrap();
+    }
+}
+
+#[test]
+fn socket_drain_peers_rejects_nonempty_drained_payload() {
+    let (c0, r0) = crate::execution::rank_stream::test_pair().unwrap();
+    let mut peers = vec![Peer {
+        channel: Channel::new(c0).unwrap(),
+    }];
+    let mut rank0 = Channel::new(r0).unwrap();
+    let t0 = std::thread::spawn(move || {
+        assert!(rank0.receive(DRAIN).unwrap().is_empty());
+        rank0.send(DRAINED, &[1]).unwrap();
+    });
+    let err = drain_peers(&mut peers).unwrap_err().to_string();
+    assert!(err.contains("unexpected rank drain payload"), "{err}");
+    t0.join().unwrap();
+}
+
+struct FakePeerExecutor {
+    manifest: ExecutionManifest,
+    next_fence: u64,
+    in_flight: VecDeque<(Fence, usize)>,
+    ready_to_complete: VecDeque<FrameCompletion>,
+    drain_ok: bool,
+    closed: bool,
+    auto_complete: bool,
+}
+
+impl FakePeerExecutor {
+    fn new(manifest: ExecutionManifest, auto_complete: bool) -> Self {
+        Self {
+            manifest,
+            next_fence: 1,
+            in_flight: VecDeque::new(),
+            ready_to_complete: VecDeque::new(),
+            drain_ok: true,
+            closed: false,
+            auto_complete,
+        }
+    }
+}
+
+impl PeerExecutor for FakePeerExecutor {
+    fn manifest(&self) -> &ExecutionManifest {
+        &self.manifest
+    }
+    fn outstanding(&self) -> usize {
+        self.in_flight.len()
+    }
+    fn validate_submission(
+        &mut self,
+        graph: usize,
+        _uploads: &[Upload<'_>],
+        _grammar: bool,
+    ) -> Result<Option<Fence>> {
+        if graph >= self.manifest.graphs.len() {
+            return Ok(None);
+        }
+        Ok(Some(Fence(self.next_fence)))
+    }
+    fn submit(
+        &mut self,
+        graph: usize,
+        _uploads: &[Upload<'_>],
+        _grammar: bool,
+    ) -> Result<Option<Fence>> {
+        let fence = Fence(self.next_fence);
+        self.next_fence += 1;
+        self.in_flight.push_back((fence, graph));
+        if self.auto_complete {
+            let mut done = completed(1);
+            done.fence = fence;
+            done.graph_index = graph;
+            for record in done.records.iter_mut() {
+                record.submission_sequence = fence.0 as i64;
+            }
+            self.ready_to_complete.push_back(done);
+        }
+        Ok(Some(fence))
+    }
+    fn poll(&mut self) -> Result<Option<FrameCompletion>> {
+        if let Some(done) = self.ready_to_complete.pop_front() {
+            self.in_flight.pop_front();
+            return Ok(Some(done));
+        }
+        Ok(None)
+    }
+    fn park(&self) -> bool {
+        false
+    }
+    fn close(&mut self) -> Shutdown {
+        self.closed = true;
+        Shutdown {
+            drained: self.drain_ok,
+            error: (!self.drain_ok).then(|| invalid("synthetic drain failure")),
+        }
+    }
+}
+
+#[test]
+fn socket_peer_control_loop_enforces_prepare_commit_drain_release_invariants() {
+    let manifest = super::super::tests::manifest();
+
+    // 1. Valid lifecycle: PREPARE -> READY -> COMMIT -> COMPLETE -> DRAIN -> DRAINED -> RELEASE.
+    {
+        let (coord_s, peer_s) = crate::execution::rank_stream::test_pair().unwrap();
+        let mut coord = Channel::new(coord_s).unwrap();
+        let mut peer_ch = Channel::new(peer_s).unwrap();
+        let mut fake = FakePeerExecutor::new(manifest.clone(), true);
+        let peer_thread = std::thread::spawn(move || {
+            let result = run_peer_control_loop(&mut peer_ch, &mut fake);
+            (result, fake.closed)
+        });
+        wire::prepare(&manifest, Fence(1), 0, false, &[], |tag, bytes| {
+            coord.send(tag, bytes)
+        })
+        .unwrap();
+        let ready = coord.receive(READY).unwrap();
+        assert_eq!(read_identity(&ready).unwrap(), (Fence(1), 0));
+        coord.send(COMMIT, &identity(Fence(1), 0)).unwrap();
+        let comp = coord.receive(COMPLETE).unwrap();
+        let mut reader = Reader(&comp);
+        assert_eq!(reader.number().unwrap(), 1);
+        assert_eq!(reader.number().unwrap(), 0);
+        coord.send(DRAIN, &[]).unwrap();
+        assert!(coord.receive(DRAINED).unwrap().is_empty());
+        coord.send(RELEASE, &[]).unwrap();
+        let (result, closed) = peer_thread.join().unwrap();
+        result.unwrap();
+        assert!(closed);
+    }
+
+    // 2. Rejects duplicate PREPARE, mismatched COMMIT, COMMIT without PREPARE, DRAIN while prepared,
+    //    DRAIN while executing, unexpected command tag, and missing RELEASE after DRAINED.
+    fn assert_peer_loop_fails(
+        manifest: &ExecutionManifest,
+        auto_complete: bool,
+        expected_err: &str,
+        drive: impl FnOnce(&mut Channel, &ExecutionManifest),
+    ) {
+        let (coord_s, peer_s) = crate::execution::rank_stream::test_pair().unwrap();
+        let mut coord = Channel::new(coord_s).unwrap();
+        let mut peer_ch = Channel::new(peer_s).unwrap();
+        let mut fake = FakePeerExecutor::new(manifest.clone(), auto_complete);
+        let peer_thread = std::thread::spawn(move || run_peer_control_loop(&mut peer_ch, &mut fake));
+        drive(&mut coord, manifest);
+        let err = peer_thread.join().unwrap().unwrap_err().to_string();
+        assert!(err.contains(expected_err), "expected '{expected_err}', got '{err}'");
+    }
+
+    // COMMIT without PREPARE
+    assert_peer_loop_fails(&manifest, true, "commit arrived without preparation", |coord, _| {
+        coord.send(COMMIT, &identity(Fence(1), 0)).unwrap();
+    });
+
+    // Duplicate PREPARE while a frame is already prepared
+    assert_peer_loop_fails(&manifest, true, "already has a prepared frame", |coord, m| {
+        wire::prepare(m, Fence(1), 0, false, &[], |t, b| coord.send(t, b)).unwrap();
+        assert_eq!(read_identity(&coord.receive(READY).unwrap()).unwrap(), (Fence(1), 0));
+        wire::prepare(m, Fence(2), 0, false, &[], |t, b| coord.send(t, b)).unwrap();
+    });
+
+    // COMMIT with mismatched fence identity
+    assert_peer_loop_fails(&manifest, true, "commit identity differs", |coord, m| {
+        wire::prepare(m, Fence(1), 0, false, &[], |t, b| coord.send(t, b)).unwrap();
+        assert_eq!(read_identity(&coord.receive(READY).unwrap()).unwrap(), (Fence(1), 0));
+        coord.send(COMMIT, &identity(Fence(2), 0)).unwrap();
+    });
+
+    // DRAIN while a frame is prepared (uncommitted)
+    assert_peer_loop_fails(&manifest, true, "drain arrived with outstanding frames", |coord, m| {
+        wire::prepare(m, Fence(1), 0, false, &[], |t, b| coord.send(t, b)).unwrap();
+        assert_eq!(read_identity(&coord.receive(READY).unwrap()).unwrap(), (Fence(1), 0));
+        coord.send(DRAIN, &[]).unwrap();
+    });
+
+    // DRAIN while a committed frame is still executing
+    assert_peer_loop_fails(&manifest, false, "drain arrived with outstanding frames", |coord, m| {
+        wire::prepare(m, Fence(1), 0, false, &[], |t, b| coord.send(t, b)).unwrap();
+        assert_eq!(read_identity(&coord.receive(READY).unwrap()).unwrap(), (Fence(1), 0));
+        coord.send(COMMIT, &identity(Fence(1), 0)).unwrap();
+        coord.send(DRAIN, &[]).unwrap();
+    });
+
+    // Unexpected command tag
+    assert_peer_loop_fails(&manifest, true, "unexpected rank command", |coord, _| {
+        coord.send(READY, &[]).unwrap();
+    });
+
+    // Missing RELEASE after DRAINED (coordinator drops socket without releasing)
+    assert_peer_loop_fails(&manifest, true, "disconnected", |coord, _| {
+        coord.send(DRAIN, &[]).unwrap();
+        assert!(coord.receive(DRAINED).unwrap().is_empty());
+        let _ = coord.stream.shutdown(std::net::Shutdown::Both);
+    });
+}

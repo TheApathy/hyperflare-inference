@@ -96,6 +96,68 @@ fn read_identity(bytes: &[u8]) -> Result<(Fence, usize)> {
     Ok(value)
 }
 
+fn dispatch_commit_peers(peers: &mut [Peer], fence: Fence, graph: usize) -> Result<()> {
+    let payload = identity(fence, graph);
+    for peer in peers {
+        peer.channel.send(COMMIT, &payload)?;
+    }
+    Ok(())
+}
+
+fn drain_peers(peers: &mut [Peer]) -> Result<()> {
+    for peer in peers.iter_mut() {
+        peer.channel.nonblocking(false)?;
+        peer.channel.send(DRAIN, &[])?;
+    }
+    for peer in peers.iter_mut() {
+        if !peer.channel.receive(DRAINED)?.is_empty() {
+            return Err(invalid("unexpected rank drain payload"));
+        }
+    }
+    Ok(())
+}
+
+fn drain_startup_peers(peers: &mut [Peer]) -> bool {
+    let sent: Vec<_> = peers
+        .iter_mut()
+        .map(|peer| peer.channel.send(DRAIN, &[]).is_ok())
+        .collect();
+    let mut all_drained = sent.iter().all(|ok| *ok);
+    for (peer, sent) in peers.iter_mut().zip(sent) {
+        if !sent {
+            continue;
+        }
+        let mut peer_drained = false;
+        loop {
+            match peer.channel.wait(false) {
+                Ok((STARTED, bytes)) if bytes.is_empty() => continue,
+                Ok((DRAINED, bytes)) if bytes.is_empty() => {
+                    peer_drained = true;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        if !peer_drained {
+            all_drained = false;
+        }
+    }
+    all_drained
+}
+
+fn release_and_shutdown_peers(peers: &mut [Peer], release: bool) {
+    if release {
+        // All GPU streams have drained. A lost release can retain a peer's
+        // owner, but cannot make any rank free resources still used by CUDA.
+        for peer in peers.iter_mut() {
+            let _ = peer.channel.send(RELEASE, &[]);
+        }
+    }
+    for peer in peers.iter() {
+        let _ = peer.channel.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 /// Rank zero owns request scheduling; peer processes execute identical graph steps.
 /// Two frame slots include preparation and unconsumed all-rank completions.
 pub struct TensorParallelExecutor {
@@ -182,23 +244,11 @@ impl TensorParallelExecutor {
         })();
         if let Err(error) = startup {
             // Tuning completion is confirmed on every rank before ordinary errors.
-            let sent: Vec<_> = peers.iter_mut().map(|peer| peer.channel.send(DRAIN, &[]).is_ok()).collect();
-            for (peer, sent) in peers.iter_mut().zip(sent) {
-                if sent {
-                    loop {
-                        match peer.channel.wait(false) {
-                            Ok((STARTED, bytes)) if bytes.is_empty() => continue,
-                            Ok((DRAINED, bytes)) if bytes.is_empty() => {
-                                let _ = peer.channel.send(RELEASE, &[]);
-                                break;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-                let _ = peer.channel.stream.shutdown(std::net::Shutdown::Both);
-            }
-            if !local.close().drained {
+            // Confirm every peer AND rank zero have drained before sending RELEASE.
+            let peers_drained = drain_startup_peers(&mut peers);
+            let local_drained = local.close().drained;
+            release_and_shutdown_peers(&mut peers, peers_drained && local_drained);
+            if !local_drained {
                 eprintln!("startup coordinator cleanup did not drain; terminating the CUDA process");
                 std::process::abort();
             }
@@ -344,9 +394,7 @@ impl TensorParallelExecutor {
             if self.local.validate_submission(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero reservation changed before commit"));
             }
-            for peer in &mut self.peers {
-                peer.channel.send(COMMIT, &identity(frame.fence, frame.graph))?;
-            }
+            dispatch_commit_peers(&mut self.peers, frame.fence, frame.graph)?;
             if self.local.submit(frame.graph, &uploads, frame.grammar)? != Some(frame.fence) {
                 return Err(invalid("rank-zero submission changed after coordinated validation"));
             }
@@ -372,31 +420,14 @@ impl TensorParallelExecutor {
             if let Some(error) = &self.poison {
                 return Err(error.clone());
             }
-            for peer in &mut self.peers {
-                peer.channel.nonblocking(false)?;
-                peer.channel.send(DRAIN, &[])?;
-            }
-            for peer in &mut self.peers {
-                if !peer.channel.receive(DRAINED)?.is_empty() {
-                    return Err(invalid("unexpected rank drain payload"));
-                }
-            }
+            drain_peers(&mut self.peers)?;
             Ok(())
         })();
         let shutdown = match result {
             Err(error) => self.local.abandon(error),
             Ok(()) => self.local.close(),
         };
-        if shutdown.drained {
-            // All GPU streams have drained. A lost release can retain a peer's
-            // owner, but cannot make any rank free resources still used by CUDA.
-            for peer in &mut self.peers {
-                let _ = peer.channel.send(RELEASE, &[]);
-            }
-        }
-        for peer in &self.peers {
-            let _ = peer.channel.stream.shutdown(std::net::Shutdown::Both);
-        }
+        release_and_shutdown_peers(&mut self.peers, shutdown.drained);
         self.shutdown = Some(shutdown.clone());
         shutdown
     }
@@ -551,6 +582,158 @@ fn startup_message(channel: &mut Channel, executor: &mut GraphExecutor, expected
     Ok(Some(bytes))
 }
 
+trait PeerExecutor {
+    fn manifest(&self) -> &ExecutionManifest;
+    fn outstanding(&self) -> usize;
+    fn validate_submission(
+        &mut self,
+        graph: usize,
+        uploads: &[Upload<'_>],
+        grammar: bool,
+    ) -> Result<Option<Fence>>;
+    fn submit(
+        &mut self,
+        graph: usize,
+        uploads: &[Upload<'_>],
+        grammar: bool,
+    ) -> Result<Option<Fence>>;
+    fn poll(&mut self) -> Result<Option<FrameCompletion>>;
+    fn park(&self) -> bool;
+    fn close(&mut self) -> Shutdown;
+}
+
+impl PeerExecutor for GraphExecutor {
+    fn manifest(&self) -> &ExecutionManifest {
+        self.manifest()
+    }
+    fn outstanding(&self) -> usize {
+        self.outstanding()
+    }
+    fn validate_submission(
+        &mut self,
+        graph: usize,
+        uploads: &[Upload<'_>],
+        grammar: bool,
+    ) -> Result<Option<Fence>> {
+        self.validate_submission(graph, uploads, grammar)
+    }
+    fn submit(
+        &mut self,
+        graph: usize,
+        uploads: &[Upload<'_>],
+        grammar: bool,
+    ) -> Result<Option<Fence>> {
+        self.submit(graph, uploads, grammar)
+    }
+    fn poll(&mut self) -> Result<Option<FrameCompletion>> {
+        self.poll()
+    }
+    fn park(&self) -> bool {
+        self.park()
+    }
+    fn close(&mut self) -> Shutdown {
+        self.close()
+    }
+}
+
+fn run_peer_control_loop(channel: &mut Channel, executor: &mut impl PeerExecutor) -> Result<()> {
+    let mut prepared: Option<(Fence, usize, bool, Vec<OwnedUpload>)> = None;
+    let mut prepared_at: Option<Instant> = None;
+    let mut started = VecDeque::new();
+    loop {
+        let active = executor.outstanding() != 0 || prepared.is_some();
+        let message = if active {
+            channel.nonblocking(true)?;
+            channel.poll()?
+        } else {
+            Some(channel.wait(true)?)
+        };
+        if let Some((tag, bytes)) = message {
+            match tag {
+                DRAIN if bytes.is_empty() => {
+                    if active {
+                        return Err(invalid("rank drain arrived with outstanding frames"));
+                    }
+                    let shutdown = executor.close();
+                    if !shutdown.drained {
+                        return Err(shutdown
+                            .error
+                            .unwrap_or_else(|| invalid("rank did not drain")));
+                    }
+                    channel.send(DRAINED, &[])?;
+                    if !channel.receive(RELEASE)?.is_empty() {
+                        return Err(invalid("unexpected rank release payload"));
+                    }
+                    return Ok(());
+                }
+                PREPARE | PREPARE_MORE => {
+                    if prepared.is_some() {
+                        return Err(invalid("rank already has a prepared frame"));
+                    }
+                    let (fence, graph, grammar, owned) =
+                        receive_prepare(channel, executor.manifest(), tag, bytes)?;
+                    let uploads: Vec<_> = owned
+                        .iter()
+                        .map(|upload| Upload {
+                            buffer: &upload.buffer,
+                            offset: upload.offset,
+                            bytes: &upload.bytes,
+                        })
+                        .collect();
+                    if executor.validate_submission(graph, &uploads, grammar)? != Some(fence) {
+                        return Err(invalid("rank submission sequence or capacity differs"));
+                    }
+                    channel.send(READY, &identity(fence, graph))?;
+                    prepared = Some((fence, graph, grammar, owned));
+                    prepared_at = Some(Instant::now());
+                }
+                COMMIT => {
+                    let (fence, graph) = read_identity(&bytes)?;
+                    prepared_at = None;
+                    let (expected, expected_graph, grammar, owned) = prepared
+                        .take()
+                        .ok_or_else(|| invalid("rank commit arrived without preparation"))?;
+                    if fence != expected || graph != expected_graph {
+                        return Err(invalid("rank commit identity differs"));
+                    }
+                    let uploads: Vec<_> = owned
+                        .iter()
+                        .map(|upload| Upload {
+                            buffer: &upload.buffer,
+                            offset: upload.offset,
+                            bytes: &upload.bytes,
+                        })
+                        .collect();
+                    if executor.submit(graph, &uploads, grammar)? != Some(fence) {
+                        return Err(invalid("rank lost its prepared submission"));
+                    }
+                    started.push_back(Instant::now());
+                }
+                _ => return Err(invalid("unexpected rank command")),
+            }
+        }
+        if let Some(completed) = executor.poll()? {
+            started.pop_front();
+            channel.send(COMPLETE, &completion(&completed))?;
+        }
+        if prepared_at.is_some_and(|time| time.elapsed() > TIMEOUT) {
+            return Err(invalid("rank commit deadline expired after preparation"));
+        }
+        if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
+            return Err(invalid("rank graph completion deadline expired"));
+        }
+        // A peer waiting only on its own running frame parks on it; a prepared frame waits
+        // for rank zero's commit over the socket, which cannot end a park. The yield keeps
+        // the old loop's cooperative handoff after either.
+        if active {
+            if prepared.is_none() {
+                executor.park();
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// Run a peer's native control loop until coordinated drain and release.
 ///
 /// # Safety
@@ -612,82 +795,7 @@ pub unsafe fn serve_rank(
             }
             executor.finish_startup()?;
             channel.send(STARTED, &[])?;
-            let mut prepared: Option<(Fence, usize, bool, Vec<OwnedUpload>)> = None;
-            let mut prepared_at: Option<Instant> = None;
-            let mut started = VecDeque::new();
-            loop {
-                let active = executor.outstanding() != 0 || prepared.is_some();
-                let message = if active {
-                    channel.nonblocking(true)?;
-                    channel.poll()?
-                } else {
-                    Some(channel.wait(true)?)
-                };
-                if let Some((tag, bytes)) = message {
-                    match tag {
-                        DRAIN if bytes.is_empty() => {
-                            if active { return Err(invalid("rank drain arrived with outstanding frames")); }
-                            let shutdown = executor.close();
-                            if !shutdown.drained {
-                                return Err(shutdown.error.unwrap_or_else(|| invalid("rank did not drain")));
-                            }
-                            channel.send(DRAINED, &[])?;
-                            if !channel.receive(RELEASE)?.is_empty() {
-                                return Err(invalid("unexpected rank release payload"));
-                            }
-                            return Ok(());
-                        }
-                        PREPARE | PREPARE_MORE => {
-                            if prepared.is_some() { return Err(invalid("rank already has a prepared frame")); }
-                            let (fence, graph, grammar, owned) =
-                                receive_prepare(&mut channel, executor.manifest(), tag, bytes)?;
-                            let uploads: Vec<_> = owned.iter().map(|upload| Upload {
-                                buffer: &upload.buffer, offset: upload.offset, bytes: &upload.bytes,
-                            }).collect();
-                            if executor.validate_submission(graph, &uploads, grammar)? != Some(fence) {
-                                return Err(invalid("rank submission sequence or capacity differs"));
-                            }
-                            channel.send(READY, &identity(fence, graph))?;
-                            prepared = Some((fence, graph, grammar, owned));
-                            prepared_at = Some(Instant::now());
-                        }
-                        COMMIT => {
-                            let (fence, graph) = read_identity(&bytes)?;
-                            prepared_at = None;
-                            let (expected, expected_graph, grammar, owned) = prepared.take()
-                                .ok_or_else(|| invalid("rank commit arrived without preparation"))?;
-                            if fence != expected || graph != expected_graph {
-                                return Err(invalid("rank commit identity differs"));
-                            }
-                            let uploads: Vec<_> = owned.iter().map(|upload| Upload {
-                                buffer: &upload.buffer, offset: upload.offset, bytes: &upload.bytes,
-                            }).collect();
-                            if executor.submit(graph, &uploads, grammar)? != Some(fence) {
-                                return Err(invalid("rank lost its prepared submission"));
-                            }
-                            started.push_back(Instant::now());
-                        }
-                        _ => return Err(invalid("unexpected rank command")),
-                    }
-                }
-                if let Some(completed) = executor.poll()? {
-                    started.pop_front();
-                    channel.send(COMPLETE, &completion(&completed))?;
-                }
-                if prepared_at.is_some_and(|time| time.elapsed() > TIMEOUT) {
-                    return Err(invalid("rank commit deadline expired after preparation"));
-                }
-                if started.front().is_some_and(|time| time.elapsed() > TIMEOUT) {
-                    return Err(invalid("rank graph completion deadline expired"));
-                }
-                // A peer waiting only on its own running frame parks on it; a prepared frame waits
-                // for rank zero's commit over the socket, which cannot end a park. The yield keeps
-                // the old loop's cooperative handoff after either.
-                if active {
-                    if prepared.is_none() { executor.park(); }
-                    std::thread::yield_now();
-                }
-            }
+            run_peer_control_loop(&mut channel, &mut executor)
         })();
         if let Err(error) = &result {
             let _ = channel.nonblocking(false);
