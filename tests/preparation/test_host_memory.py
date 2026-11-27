@@ -32,6 +32,14 @@ def test_cgroup_memory_uses_tightest_remaining_ancestor_allowance(tmp_path):
     assert host_memory._cgroup_available_bytes(*files) == 200
 
 
+def test_cgroup_memory_excludes_reclaimable_inactive_file_cache(tmp_path):
+    files = _cgroup_files(tmp_path, limits={"ranks/job": (1000, 800)})
+    (tmp_path / "cgroup mount" / "ranks" / "job" / "memory.stat").write_text(
+        "anon 300\nfile 450\ninactive_file 400\n"
+    )
+    assert host_memory._cgroup_available_bytes(*files) == 600
+
+
 @pytest.mark.parametrize("maximum,current,expected", [(1000, 500, 500), (1000, 1100, 0), ("max", 100, None)])
 def test_cgroup_memory_handles_finite_unlimited_and_exceeded_limits(tmp_path, maximum, current, expected):
     files = _cgroup_files(tmp_path, limits={"ranks/job": (maximum, current)})

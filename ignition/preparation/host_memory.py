@@ -51,8 +51,20 @@ def release_unused(*, generation=2):
     trim(0)
 
 
+def _cgroup_inactive_file_bytes(directory: Path) -> int:
+    """Reclaimable clean file cache included in cgroup-v2 memory.current."""
+    try:
+        for line in (directory / "memory.stat").read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == "inactive_file":
+                return max(0, int(value))
+    except FileNotFoundError:
+        pass
+    return 0
+
+
 def _cgroup_available_bytes(cgroups=Path("/proc/self/cgroup"), mounts=Path("/proc/self/mountinfo")):
-    """Remaining memory under every visible finite cgroup-v2 ancestor limit."""
+    """Remaining allocatable memory under every visible finite cgroup-v2 ancestor limit."""
     group = next((Path(line.split(":", 2)[2]) for line in cgroups.read_text().splitlines()
                   if line.startswith("0::")), None)
     if group is None:
@@ -73,7 +85,8 @@ def _cgroup_available_bytes(cgroups=Path("/proc/self/cgroup"), mounts=Path("/pro
                 limit = (directory / "memory.max").read_text().strip()
                 if limit != "max":
                     used = int((directory / "memory.current").read_text())
-                    remaining.append(max(0, int(limit) - used))
+                    working_set = max(0, used - _cgroup_inactive_file_bytes(directory))
+                    remaining.append(max(0, int(limit) - working_set))
             except FileNotFoundError:
                 pass
             if directory == mount:
