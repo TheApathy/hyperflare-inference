@@ -91,7 +91,8 @@ class RecordedPreparationSession(PreparationSession):
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
                  numerical_policy: str, search_limits=None, namespace=None, race_budget=None,
                  coordinator=None, headroom_bytes=0, benchmark_storage=None, compile_workers=None,
-                 tuning_replica=None, autotune_effort="default", native_dense_activations=False, lock_gpu_clocks=False):
+                 tuning_replica=None, autotune_effort="default", native_dense_activations=False,
+                 deterministic_output=False, lock_gpu_clocks=False):
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("tuning requires an exact checkpoint revision")
         if any(not isinstance(value, str) or not value for value in (workload_schema, numerical_policy)):
@@ -104,6 +105,7 @@ class RecordedPreparationSession(PreparationSession):
                         numerical_policy=numerical_policy)
         self.autotune_effort = AutotuneEffort(autotune_effort).value
         self.native_dense_activations = native_dense_activations
+        self.deterministic_output = bool(deterministic_output)
         self.lock_gpu_clocks = lock_gpu_clocks
         _prepare_compiler_toolchain()
         with b12x_autotune_effort(self.autotune_effort):
@@ -542,6 +544,7 @@ class RecordedPreparationSession(PreparationSession):
                 "workload_schema": self._workload_schema, "namespace": self.namespace.to_dict(),
                 "autotune_effort": self.autotune_effort,
                 "native_dense_activations": self.native_dense_activations,
+                "deterministic_output": self.deterministic_output,
                 "requests": len(requests), "compile_workers": self.compile_workers,
                 "tuning_replicas": 1 if self.tuning_replica is None else self.tuning_replica.replicas,
                 "race_budget_bytes": self.race_budget, "headroom_bytes": self.headroom_bytes,
