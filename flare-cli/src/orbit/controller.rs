@@ -3402,4 +3402,147 @@ mod tests {
             fs::metadata(&nested).unwrap().len()
         );
     }
+
+    #[test]
+    fn repository_run_downloads_stats_and_starts_rank_on_node() {
+        use flare_helios::core::cache::{self, CoreSource, Root};
+
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let (core, profile_path, publisher, commit) =
+            crate::hub::tests::signed_payload_fixture(fixture_dir.path());
+        let model_root = fixture_dir.path().join("node-core-cache");
+        let root = Root::open(&model_root).unwrap();
+        let metadata = flare_helios::core::reader::Metadata::open(&core).unwrap();
+        let selections = crate::core_cache::select_deployments(
+            &metadata,
+            std::slice::from_ref(&publisher),
+            &[1],
+        )
+        .unwrap();
+        let source = CoreSource::open(&core, std::slice::from_ref(&publisher), selections[0])
+            .unwrap()
+            .union(std::slice::from_ref(&publisher), &selections)
+            .unwrap();
+        let model_key = cache::model_key("owner/offline").unwrap();
+        let expected_envelope = source.verified()[0].envelope_digest();
+        let entry = root
+            .install_core_staged(source, &model_key, "entry-tp1")
+            .unwrap();
+        let primary = root.primary(&entry).unwrap();
+        assert!(primary.is_file());
+        let download_options = crate::cli::HubOptions {
+            revision: Some(commit.clone()),
+            core_cache: Some(model_root.clone()),
+            cache_dir: Some(fixture_dir.path().join("hub")),
+            tensor_parallel: vec![1],
+            offline: true,
+            ..Default::default()
+        };
+        crate::hub::remember_download(
+            &model_root,
+            "owner/offline",
+            &commit,
+            &commit,
+            "model.safetensors",
+            &download_options,
+            0,
+            &entry,
+            expected_envelope,
+        )
+        .unwrap();
+
+        let mut gpus = crate::orbit::agent::tests::fake_gpus();
+        for gpu in &mut gpus {
+            gpu.revision = "gb202".into();
+        }
+        let zero = crate::orbit::agent::tests::harness_with(41, gpus, Some(model_root));
+        let record = {
+            let mut session = pair_accept_first(&zero);
+            session.request(frame::STATUS, &json!({})).unwrap();
+            crate::orbit::agent::tests::record(&zero.controller)
+        };
+        let node = Node {
+            name: "zero".into(),
+            fingerprint: zero.agent.key.public().fingerprint(),
+            public_key: zero.agent.key.public().to_hex(),
+            address: zero.address.clone(),
+        };
+        let orbit = Orbit {
+            controllers: Some(record),
+            node: vec![node.clone()],
+            cluster: Default::default(),
+            group: Vec::new(),
+        };
+        let mut controller = Controller::new(
+            Key::from_seed(&[41; 32]).unwrap(),
+            orbit,
+            fixture_dir.path().join("orbit.toml"),
+        );
+
+        let crate::cli::Command::Run(run_args) =
+            <crate::cli::Cli as clap::Parser>::try_parse_from(["flare", "run", "owner/offline"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected flare run command");
+        };
+        let mut run_args = *run_args;
+        run_args.serving.hub = crate::cli::HubOptions {
+            revision: Some(commit),
+            tensor_parallel: vec![1],
+            offline: true,
+            ..Default::default()
+        };
+        run_args.serving.publisher_keys = vec![profile_path];
+        run_args.serving.trust_store = Some(fixture_dir.path().join("trust.toml"));
+        run_args.serving.dangerously_approve_key = Some(publisher.fingerprint());
+        run_args.serving.dangerously_accept_publisher = Some(publisher.namespace.clone());
+
+        controller
+            .run(
+                Some("owner/offline"),
+                None,
+                RunOptions {
+                    name: None,
+                    persistent: false,
+                    nodes: vec!["zero".into()],
+                    gpus: Vec::new(),
+                    dry_run: false,
+                    serving: Vec::new(),
+                    rank_zero: Vec::new(),
+                    roce_ring: false,
+                    transfer_streams: None,
+                    roce_chain: false,
+                    executable: None,
+                    detach: true,
+                    verify_weights: false,
+                    run_args,
+                },
+            )
+            .unwrap();
+
+        let status = controller.node_status(&node, None).unwrap();
+        assert_eq!(status.groups.len(), 1);
+        let group = &status.groups[0];
+        assert_eq!(group.name, "offline");
+        assert_eq!(group.rank, 0);
+
+        let mut session = crate::orbit::agent::tests::connect(&zero, &zero.controller);
+        session
+            .request(frame::ATTACH, &json!({"group": group.id}))
+            .unwrap();
+        let (lines, exit) = crate::orbit::agent::tests::collect(&mut session);
+        assert_eq!(exit, 0, "rank exited with {exit}: {lines:?}");
+        let expected_executable = zero.temp.path().join("installed-flare");
+        assert!(
+            lines.contains(&expected_executable.to_string_lossy().into_owned()),
+            "{lines:?}"
+        );
+        let expected_prefix = format!("run {} --core-cache ", primary.display());
+        assert!(
+            lines.iter().any(|line| line.starts_with(&expected_prefix)),
+            "expected rank start with resolved primary core file {expected_prefix:?}, got {lines:?}"
+        );
+        controller.remove(&group.id).unwrap();
+    }
 }

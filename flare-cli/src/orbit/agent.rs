@@ -438,6 +438,8 @@ pub struct Agent {
     sampled_gpus: Mutex<Option<(u64, Vec<Gpu>)>>,
     #[cfg(test)]
     fabric_endpoints: Option<Vec<u8>>,
+    #[cfg(test)]
+    pub(crate) core_cache: Option<PathBuf>,
 }
 
 /// How often the sampler reads GPUs and scrapes running rank-zero groups.
@@ -475,6 +477,8 @@ impl Agent {
             sampled_gpus: Mutex::new(None),
             #[cfg(test)]
             fabric_endpoints: None,
+            #[cfg(test)]
+            core_cache: None,
         })
     }
 
@@ -816,6 +820,10 @@ fn session(agent: &Arc<Agent>, stream: TcpStream) -> Result<(), Failure> {
                     serde_json::from_value(json_body(&mut session, length)?)?;
                 request.options =
                     node_download_options(agent.hub_cache.as_deref(), request.options);
+                #[cfg(test)]
+                if request.options.core_cache.is_none() {
+                    request.options.core_cache = agent.core_cache.clone();
+                }
                 if hello.download_progress {
                     let storage = storage_estimate(&request.options);
                     let counters = flare_helios::core::progress::AcquisitionProgress::new();
@@ -1972,6 +1980,10 @@ pub mod tests {
     }
 
     pub fn harness(seed: u8) -> Harness {
+        harness_with(seed, fake_gpus(), None)
+    }
+
+    pub fn harness_with(seed: u8, gpus: Vec<Gpu>, core_cache: Option<PathBuf>) -> Harness {
         let temp = tempfile::tempdir().unwrap();
         let dir = AgentDir::new(temp.path().join("agent"));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1991,11 +2003,12 @@ pub mod tests {
                 record.lock().unwrap().push((primary.to_owned(), rank));
                 Ok(())
             }),
-            Box::new(|| Ok(fake_gpus())),
+            Box::new(move || Ok(gpus.clone())),
         )
         .unwrap();
         agent.executable = temp.path().join("installed-flare");
         agent.fabric_endpoints = Some(b"loopback 127.0.0.1/8 -\n".to_vec());
+        agent.core_cache = core_cache;
         fs::write(&agent.executable, "#!/bin/sh\necho \"$0\"\necho \"$@\"\n").unwrap();
         fs::set_permissions(&agent.executable, fs::Permissions::from_mode(0o755)).unwrap();
         let agent = Arc::new(agent);

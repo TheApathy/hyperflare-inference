@@ -355,22 +355,38 @@ fn parse_call(body: &str) -> Result<(String, String, usize)> {
             let (raw, tail) = raw
                 .split_once("<|close|>argument<|sep|>")
                 .ok_or("unterminated XTML argument")?;
-            let value: Value = if kind == "string" {
-                Value::String(unescape(raw))
-            } else {
-                serde_json::from_str(&unescape(raw))
-                    .map_err(|error| format!("invalid XTML JSON argument: {error}"))?
+            let decoded = unescape(raw);
+            let value = match kind {
+                "string" => Value::String(decoded),
+                "number" | "boolean" | "object" | "array" | "null" => {
+                    match serde_json::from_str::<Value>(&decoded) {
+                        Ok(parsed) => {
+                            let matches = match kind {
+                                "number" => parsed.is_number(),
+                                "boolean" => parsed.is_boolean(),
+                                "object" => parsed.is_object(),
+                                "array" => parsed.is_array(),
+                                "null" => parsed.is_null(),
+                                _ => unreachable!(),
+                            };
+                            if !matches {
+                                return Err(
+                                    "XTML argument types must match values and keys must be unique"
+                                        .into(),
+                                );
+                            }
+                            parsed
+                        }
+                        Err(_) => Value::String(decoded),
+                    }
+                }
+                _ => {
+                    return Err(
+                        "XTML argument types must match values and keys must be unique".into(),
+                    );
+                }
             };
-            let valid = match kind {
-                "string" => value.is_string(),
-                "number" => value.is_number(),
-                "boolean" => value.is_boolean(),
-                "object" => value.is_object(),
-                "array" => value.is_array(),
-                "null" => value.is_null(),
-                _ => false,
-            };
-            if !valid || arguments.insert(key.into(), value).is_some() {
+            if arguments.insert(key.into(), value).is_some() {
                 return Err("XTML argument types must match values and keys must be unique".into());
             }
             rest = tail;
@@ -540,14 +556,93 @@ mod tests {
             ("object", "[]"),
             ("null", "0"),
             ("unknown", "1"),
+            ("unknown", "not json"),
         ] {
-            assert!(parse_call(&call(kind, value)).is_err());
+            assert!(parse_call(&call(kind, value)).is_err(), "{kind}={value}");
         }
         assert!(parse_call(&call("number", "3").replace("lookup", "")).is_err());
         assert_eq!(
             parse_call(&call("string", "&quot;literal\"")).unwrap().1,
             "{\"x\":\"&quot;literal\\\"\"}"
         );
+        // Invalid JSON in a whole JSON argument document still fails parsing.
+        let bad_document = concat!(
+            "<|open|>call tool=\"lookup\" index=\"1\"<|sep|>",
+            "<|open|>json type=\"object\"<|sep|>{not json<|close|>json<|sep|>",
+            "<|close|>call<|sep|>"
+        );
+        assert!(parse_call(bad_document).is_err());
+    }
+
+    #[test]
+    fn non_json_typed_arguments_are_retained_as_strings() {
+        let deep = format!("{}1{}", "[".repeat(140), "]".repeat(140));
+        let cases: [(&str, &str, &str); 8] = [
+            ("num", "number", "3 apples"),
+            ("flag", "boolean", "yes"),
+            ("empty", "null", ""),
+            ("arr", "array", r#"["grep -E '[0-9]+\.[0-9]+' a.log"]"#),
+            ("obj", "object", r#"{"command": "sed 's/"old"/new/g'"}"#),
+            ("unterm", "object", r#""echo unterminated"#),
+            ("escaped", "object", "a < b & c"),
+            ("deep", "array", deep.as_str()),
+        ];
+        let mut call_text = String::from(concat!(
+            "Thinking.<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"run\" index=\"1\"<|sep|>"
+        ));
+        call_text.push_str(
+            "<|open|>argument key=\"valid_num\" type=\"number\"<|sep|>42<|close|>argument<|sep|>",
+        );
+        for (key, kind, raw) in &cases {
+            call_text.push_str(&format!(
+                "<|open|>argument key=\"{key}\" type=\"{kind}\"<|sep|>{}<|close|>argument<|sep|>",
+                escape(raw)
+            ));
+        }
+        call_text.push_str(concat!(
+            "<|open|>argument key=\"valid_arr\" type=\"array\"<|sep|>[1,2]<|close|>argument<|sep|>",
+            "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        ));
+
+        for split in call_text
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain([call_text.len()])
+        {
+            let mut parser = XtmlOutput::new(
+                OutputConfig {
+                    structured: false,
+                    start: crate::output::tagged::OutputStart::Reasoning,
+                    tools: vec![json!({"function":{"name":"run"}})],
+                },
+                vec![],
+            );
+            let mut output = Accumulator::new("retained".into());
+            output
+                .apply(parser.push_encoded(&call_text[..split]).unwrap())
+                .unwrap();
+            output
+                .apply(parser.push_encoded(&call_text[split..]).unwrap())
+                .unwrap();
+            output
+                .apply(parser.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            let message = output.message();
+            assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
+            let arguments: Value = serde_json::from_str(
+                message["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(arguments["valid_num"], json!(42), "split {split}");
+            assert_eq!(arguments["valid_arr"], json!([1, 2]), "split {split}");
+            for (key, _, raw) in &cases {
+                assert_eq!(arguments[*key], json!(*raw), "key {key} split {split}");
+            }
+        }
     }
 
     #[test]

@@ -106,10 +106,6 @@
 [ ] Run scripts/build_deb.sh in Docker and confirm the produced Debian package
     contains every license file installed by packaging/debian/package.sh.
 
-[ ] Add an Orbit controller test confirming `flare orbit run ORG/NAME` reaches
-    rank start after agent DOWNLOAD and STAT (agent download resolves the
-    regular primary core file in flare-cli/src/orbit/agent.rs).
-
 [ ] Reduce export memory with deferred graph executables and packed sparse
     initializers. Preflight aggregate metadata bounds before payload publication.
     Preserve core compatibility. See runtime-core-design.md.
@@ -159,10 +155,6 @@
     composite store with qualify/host_cache_isolation.py. Every threshold in
     prefix-cache-offload.md section 4 must hold before derived host-store
     defaults are implemented.
-
-[ ] Add a fault-injection test across rank processes for sharded-store partial
-    failure: when one rank fails a store, rank zero unlinks the other ranks'
-    files. Only the bookkeeping has unit coverage.
 
 [ ] Test record sharing between a pooled instance whose ranks span hosts and a
     single-process instance of the same TP width: restore a record written by
@@ -215,10 +207,6 @@
     address collision; and format-4 and format-6 container loading. See
     windows.md#serve-a-prepared-core.
 
-[ ] Give process_nonce and secret in selene/src/shared/identity.rs a Windows
-    random source; they open /dev/urandom, so the selene test suite is not
-    qualified on Windows.
-
 [ ] Qualify the Windows desktop client beyond Windows 11 ARM64: x64 linking and
     inference, Flare.exe on a machine without the development environment,
     transfer interruption, switching under load, accessibility, and recovery
@@ -240,12 +228,6 @@
 [ ] Publish Debian packages with releases and update the APT repository from
     them. release.yml builds no .deb, and no tracked tool builds or signs an
     APT index. See debian.md and release.md.
-
-[ ] Decide whether an XTML typed argument value that is not valid JSON is
-    retained as a string, as tagged and DeepSeek string="false" values are.
-    helios/src/output/xtml.rs fails the call with "invalid XTML JSON argument".
-    Close when XTML retains the text with tests, or docs/api.md states that the
-    difference is intended.
 
 [ ] Add parser-start tests in helios/tests/parser_start.rs for MiniMax M3, Muse
     Spark and dense Qwen3.8, whose Jinja prompts skip a marker spelled by request

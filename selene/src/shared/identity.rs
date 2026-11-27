@@ -173,23 +173,51 @@ pub fn instance_id(
     hash.finalize().into()
 }
 
+#[cfg(unix)]
+fn fill_random(buffer: &mut [u8], action: &str) -> Result<()> {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(buffer))
+        .map_err(|error| Error::caused_by(action, error))
+}
+
+#[cfg(windows)]
+fn fill_random(buffer: &mut [u8], action: &str) -> Result<()> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    let length = u32::try_from(buffer.len())
+        .map_err(|_| Error::new("random byte request exceeds Windows buffer limit"))?;
+    // SAFETY: `buffer` is valid for `length` writable bytes and
+    // `BCRYPT_USE_SYSTEM_PREFERRED_RNG` uses a null algorithm handle.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr(),
+            length,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(Error::caused_by(
+            action,
+            std::io::Error::other(format!("BCryptGenRandom failed with NTSTATUS {status:#x}")),
+        ));
+    }
+    Ok(())
+}
+
 /// 32 fresh random bytes: the secret rank 0 of a multi-process instance gives its peers.
 pub fn secret() -> Result<[u8; 32]> {
-    use std::io::Read;
     let mut secret = [0u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut secret))
-        .map_err(|error| Error::caused_by("cannot draw a rank secret", error))?;
+    fill_random(&mut secret, "cannot draw a rank secret")?;
     Ok(secret)
 }
 
 /// 16 fresh random bytes naming this process; unchanged across reconnects.
 pub fn process_nonce() -> Result<[u8; 16]> {
-    use std::io::Read;
     let mut nonce = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut nonce))
-        .map_err(|error| Error::caused_by("cannot draw a process nonce", error))?;
+    fill_random(&mut nonce, "cannot draw a process nonce")?;
     Ok(nonce)
 }
 
@@ -283,7 +311,21 @@ mod tests {
     }
 
     #[test]
-    fn nonces_differ() {
-        assert_ne!(process_nonce().unwrap(), process_nonce().unwrap());
+    fn nonces_and_secrets_are_nonzero_distinct_and_sized() {
+        let first_nonce = process_nonce().unwrap();
+        let second_nonce = process_nonce().unwrap();
+        assert_eq!(first_nonce.len(), 16);
+        assert_eq!(second_nonce.len(), 16);
+        assert_ne!(first_nonce, [0u8; 16]);
+        assert_ne!(second_nonce, [0u8; 16]);
+        assert_ne!(first_nonce, second_nonce);
+
+        let first_secret = secret().unwrap();
+        let second_secret = secret().unwrap();
+        assert_eq!(first_secret.len(), 32);
+        assert_eq!(second_secret.len(), 32);
+        assert_ne!(first_secret, [0u8; 32]);
+        assert_ne!(second_secret, [0u8; 32]);
+        assert_ne!(first_secret, second_secret);
     }
 }

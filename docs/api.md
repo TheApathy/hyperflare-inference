@@ -535,8 +535,10 @@ guide argument conversion where the tool syntax requires it; unknown tools have
 no schema for that conversion. Malformed envelopes and empty names still fail
 parsing. Tagged parameters, as in GLM, retain malformed JSON values as strings.
 DeepSeek retains the original text of a `string="false"` parameter that cannot
-be decoded inside the argument object. Invalid JSON in a whole argument document
-or a typed XTML value fails parsing. Required mode needs at least one declared
+be decoded inside the argument object. Typed XTML arguments likewise retain
+values that cannot be decoded as JSON as strings, while valid JSON values whose
+type disagrees with the declared XTML type and invalid JSON in a whole argument
+document fail parsing. Required mode needs at least one declared
 tool, adds an instruction to call a tool to the prompt, and validates that
 generation produced at least one
 completed call to a declared tool. Sampling is unchanged; no calls are fabricated
