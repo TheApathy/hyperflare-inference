@@ -244,7 +244,11 @@ impl RequestScheduler {
         self.policy = policy;
         self.speculative_batch_fixed = policy.speculative_width_by_batch;
         if batch_fixed_changed && !self.speculative_widths.is_empty() {
-            self.refresh_speculative_catalog();
+            if let Some(shapes) = self.speculative_manifest_shapes.clone() {
+                let _ = self.speculative_graphs(&shapes);
+            } else {
+                self.refresh_speculative_catalog();
+            }
         }
         self.costs.advance_to(self.now_ns, policy.estimate_ttl_ns);
         Ok(())

@@ -11,6 +11,11 @@ license-files = ["LICENSE", "NOTICE", "helios/licenses/PyTorch.txt"]
 requires-python = ">=3.12,<3.13"
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/TheApathy/hyperflare-inference"
+Repository = "https://github.com/TheApathy/hyperflare-inference"
+Issues = "https://github.com/TheApathy/hyperflare-inference/issues"
+
 [project.scripts]
 ignition = "ignition.__main__:main"
 

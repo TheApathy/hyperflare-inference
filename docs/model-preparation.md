@@ -238,11 +238,14 @@ shared-memory limits on DGX Spark.
 Forward compilation allocates workers across each host after checking cached
 forwards. Ranks without a worker lend missing forwards to other
 ranks on that host; every serving rank binds and captures its full catalog.
-Concurrency uses a 32 GiB host-RAM estimate per worker, plus device storage on
-integrated GPUs. When that estimate admits no worker, one worker per host may
-start under the 2 GiB minimum host allowance plus integrated device storage.
-These allowances estimate compiler demand; actual peaks depend on the forward.
-Linux cgroup-v2 memory limits also constrain the available RAM used for admission.
+Discrete GPUs use a 32 GiB host-RAM estimate per worker; integrated UMA GPUs
+(such as DGX Spark GB10) use a 6 GiB host-RAM + 2 GiB device-memory estimate
+(8 GiB total per worker) and stream single-rank compiled-forward capture to
+bound peak resident memory. When that estimate admits no worker, one worker per
+host may start under the 2 GiB minimum host allowance plus integrated device
+storage. These allowances estimate compiler demand; actual peaks depend on the
+forward. Linux cgroup-v2 memory limits also constrain the available RAM used for
+admission.
 
 On integrated GPUs, kernel tuning is divided into memory-bounded jobs. The
 terminal dashboard shows the active job number and total job count, with a

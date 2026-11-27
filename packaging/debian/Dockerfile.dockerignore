@@ -25,6 +25,8 @@
 !selene/native/**
 !selene/src/
 !selene/src/**
+!selene/tests/
+!selene/tests/**
 !selene-manager/
 !selene-manager/Cargo.toml
 !selene-manager/tests/

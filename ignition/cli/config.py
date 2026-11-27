@@ -129,7 +129,7 @@ class Configuration:
                 seen_batches = set()
                 for entry in entries:
                     parts = entry.split(":")
-                    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                    if len(parts) != 2 or not (parts[0].isascii() and parts[0].isdigit()) or not (parts[1].isascii() and parts[1].isdigit()):
                         raise UsageError(f"{path}: invalid {key} entry {entry!r} in [{section}]: expected BATCH:WIDTH")
                     batch, width = int(parts[0]), int(parts[1])
                     if batch not in (1, 2, 4, 8, 16, 32, 64):

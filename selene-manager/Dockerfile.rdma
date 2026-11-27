@@ -16,6 +16,7 @@ COPY eos/Cargo.toml ./eos/
 COPY eos/src ./eos/src
 COPY selene/Cargo.toml selene/build.rs ./selene/
 COPY selene/src ./selene/src
+COPY selene/tests ./selene/tests
 COPY selene/examples ./selene/examples
 COPY selene/proto ./selene/proto
 COPY selene-manager/Cargo.toml selene-manager/Cargo.lock ./selene-manager/
@@ -29,6 +30,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         rdma-core libibverbs1 ibverbs-providers ibverbs-utils \
         libnl-3-200 libnl-route-3-200 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 selene \
+    && useradd --uid 10001 --gid selene --create-home --no-log-init \
+        --shell /usr/sbin/nologin selene
 COPY --from=build /build/selene-manager/target/release/selene /usr/local/bin/selene
+COPY LICENSE NOTICE /usr/share/doc/selene/
+USER selene
 ENTRYPOINT ["/usr/local/bin/selene"]

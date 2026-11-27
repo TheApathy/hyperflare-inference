@@ -467,10 +467,7 @@ pub fn join_peer(
         transfers,
         DiskThread::start("flare-offload-disk")?,
     );
-    link.send(&summary_with_literals(
-        &prepared.scanned,
-        compression != super::KvCompression::Off,
-    )?)?;
+    link.send(&summary_with_literals(&prepared.scanned, true)?)?;
     let agreed = decode_agreed(&link.expect(AGREED, REPLY_TIMEOUT)?)?;
     retain(&mut prepared, &agreed)?;
     let summary = format!(

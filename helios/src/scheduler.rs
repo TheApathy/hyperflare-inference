@@ -667,6 +667,7 @@ pub struct RequestScheduler {
     speculative_widths: Vec<usize>,
     speculative_fixed_width: Option<usize>,
     speculative_batch_fixed: [Option<usize>; 7],
+    speculative_manifest_shapes: Option<Vec<(usize, usize)>>,
     speculative_catalog: [Vec<usize>; 7],
     prefill_catalog: Vec<usize>,
     terminal_prefill_catalog: Vec<usize>,
@@ -764,6 +765,7 @@ impl RequestScheduler {
             speculative_widths: Vec::new(),
             speculative_fixed_width: None,
             speculative_batch_fixed: [None; 7],
+            speculative_manifest_shapes: None,
             speculative_catalog: Default::default(),
             prefill_catalog: prefill_capacities(limits.prefill_chunk_size).collect(),
             terminal_prefill_catalog: Vec::new(),
@@ -1115,6 +1117,7 @@ impl RequestScheduler {
                 return Err("missing speculative graph for a runtime batch capacity".into());
             }
         }
+        self.speculative_manifest_shapes = Some(shapes.to_vec());
         self.speculative_catalog = catalog;
         Ok(())
     }

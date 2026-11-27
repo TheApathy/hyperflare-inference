@@ -135,7 +135,7 @@ Decode context parallelism (DCP) distributes an attention history across ranks.
 Correct execution requires agreement on token placement, page geometry,
 global selection, collective ordering, and scratch lifetimes. Efficient
 prefill and decode can require different exchanges. Flare's
-[GLM context layout](../ignition/recipes/glm53/dcp.py) declares the rank
+[GLM context layout](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/glm53/dcp.py) declares the rank
 placement and page geometry; its prepared attention uses bounded query
 exchange for decode and gathered context for prefill. The runtime core
 carries the resulting storage and execution contract into Helios.
@@ -353,11 +353,11 @@ Recipes declare the data consumed by the shared native contract:
 
 | Recipe | Contract declaration | State and execution |
 |---|---|---|
-| [Qwen3.8 Flash](../ignition/recipes/qwen38/recipe.py) | [Prepared data](../ignition/recipes/qwen38/contract.py) | GDN recurrence, QSA sparse attention, PLE, vision, and learned or copied proposals |
-| [GLM 5.3 Flash](../ignition/recipes/glm53/recipe.py) | [Prepared data](../ignition/recipes/glm53/contract.py) | KDA recurrence, indexed MLA, mHC, vision, and learned MTP |
-| [DeepSeek V4.1 Flash](../ignition/recipes/deepseek41/recipe.py) | [Prepared data](../ignition/recipes/deepseek41/contract.py) | Compressed latent attention, sliding windows, Engram tables, and DSpark proposal composition |
-| [DeepSeek V4 Flash](../ignition/recipes/deepseek4/recipe.py) | [Prepared data](../ignition/recipes/deepseek4/contract.py) | Compressed latent attention, sliding windows, vision, and DSpark proposals |
-| [MiMo V2.6 Pro and Flash](../ignition/recipes/mimo_v2/recipe.py) | [Prepared data](../ignition/recipes/mimo_v2/contract.py) | Paged KV, sliding windows, vision, and DFlash proposals |
+| [Qwen3.8 Flash](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/qwen38/recipe.py) | [Prepared data](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/qwen38/contract.py) | GDN recurrence, QSA sparse attention, PLE, vision, and learned or copied proposals |
+| [GLM 5.3 Flash](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/glm53/recipe.py) | [Prepared data](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/glm53/contract.py) | KDA recurrence, indexed MLA, mHC, vision, and learned MTP |
+| [DeepSeek V4.1 Flash](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/deepseek41/recipe.py) | [Prepared data](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/deepseek41/contract.py) | Compressed latent attention, sliding windows, Engram tables, and DSpark proposal composition |
+| [DeepSeek V4 Flash](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/deepseek4/recipe.py) | [Prepared data](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/deepseek4/contract.py) | Compressed latent attention, sliding windows, vision, and DSpark proposals |
+| [MiMo V2.6 Pro and Flash](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/mimo_v2/recipe.py) | [Prepared data](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/mimo_v2/contract.py) | Paged KV, sliding windows, vision, and DFlash proposals |
 
 The table covers five of the recipes under `ignition/recipes/`; `ignition --help`
 lists every registered recipe alias with its supported GPU counts.
@@ -371,14 +371,14 @@ revision `dc5b8ab2fa14bc4fecd6886273b7ebc6095662e2`, on one 96 GB RTX PRO 6000
 Blackwell. The `qwen3.8-flash` recipe prepares
 `nvidia/Qwen3.8-Flash-Next-FP4-Local`, revision
 `b9ce18a6887e18c089fdea8509a33e63429a3300`, as pinned in
-[qwen38.py](../ignition/preparation/qwen38.py). The model contains 36
+[qwen38.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/qwen38/recipe.py). The model contains 36
 Gated DeltaNet layers, 12 sparse-attention layers,
 512 routed experts per decoder layer, four hyperconnection streams, PLE
 n-gram embeddings, and a vision encoder. Stored formats include NVFP4
 experts with compressed scales, MXFP8 projections, and mixed-precision
 vision weights.
 
-[pyproject.toml](../pyproject.toml) and [uv.lock](../uv.lock) declare the
+[pyproject.toml](../pyproject.toml) and [uv.lock](https://github.com/TheApathy/hyperflare-recipes/blob/main/uv.lock) declare the
 preparation dependencies. Transformers supplies canonical architecture and
 processor semantics. `pyproject.toml` tracks the `main` branch of
 `local-inference-lab/flashinfer`, and `uv.lock` records the resolved commit;
@@ -528,16 +528,16 @@ mechanisms:
 
 | Mechanism | Component and contract |
 |---|---|
-| Dense projections | [linear.py](../ignition/components/linear.py): BF16, FP32, and block-scaled plans, declared tuning, and outputs and workspaces passed as tensor operands |
-| Vocabulary projection | [vocabulary.py](../ignition/components/vocabulary.py): contiguous TP weight shards, rank-local projection, and gathered logits |
-| Embeddings | [embedding.py](../ignition/components/embedding.py): counted lookup with inactive-row zeroing |
-| Routed experts | [moe.py](../ignition/components/moe.py): FP32 route weights, model-selected scoring, and tuned expert execution |
-| Branch overlap | [expert_overlap.py](../ignition/components/expert_overlap.py) and [projection_overlap.py](../ignition/components/projection_overlap.py): explicit forks, joins, and concurrent scratch |
-| Recurrence and mixing | [recurrent.py](../ignition/components/recurrent.py) and [mhc.py](../ignition/components/mhc.py): state bindings, checkpoint export, and fused mixing |
+| Dense projections | [linear.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/linear.py): BF16, FP32, and block-scaled plans, declared tuning, and outputs and workspaces passed as tensor operands |
+| Vocabulary projection | [vocabulary.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/vocabulary.py): contiguous TP weight shards, rank-local projection, and gathered logits |
+| Embeddings | [embedding.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/embedding.py): counted lookup with inactive-row zeroing |
+| Routed experts | [moe.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/moe.py): FP32 route weights, model-selected scoring, and tuned expert execution |
+| Branch overlap | [expert_overlap.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/expert_overlap.py) and [projection_overlap.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/projection_overlap.py): explicit forks, joins, and concurrent scratch |
+| Recurrence and mixing | [recurrent.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/recurrent.py) and [mhc.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/mhc.py): state bindings, checkpoint export, and fused mixing |
 | Sampling | [sampling.py](../ignition/components/sampling.py): request epochs, Philox state, penalties, grammar masks, and completion records |
-| Token consumption | [token_state.py](../ignition/components/token_state.py): pending tokens, positions, epoch validation, and committed spans |
+| Token consumption | [token_state.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/token_state.py): pending tokens, positions, epoch validation, and committed spans |
 | Continuation storage | [state.py](../ignition/components/state.py) and [state_transfer.py](../ignition/components/state_transfer.py): aligned rows, exact endpoint transfers, and alias checks |
-| Sparse attention | [sparse_mla.py](../ignition/components/sparse_mla.py) and [indexer.py](../ignition/components/indexer.py): latent writes, selection metadata, and prepared attention |
+| Sparse attention | [sparse_mla.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/sparse_mla.py) and [indexer.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/indexer.py): latent writes, selection metadata, and prepared attention |
 | Collectives | [collectives.py](../ignition/components/collectives.py): captured b12x reductions with retained transport storage |
 
 Model contracts use the shared [graph catalog](../helios/src/model/catalog.rs)
@@ -732,7 +732,7 @@ The prepared interface supports:
 - Inactive lanes that perform no state writes.
 - Capture-safe execution without CPU sequence-length extraction.
 
-The [GDN component tests](../tests/recipes/test_qwen38_gdn.py) compare exact
+The [GDN component tests](https://github.com/TheApathy/hyperflare-recipes/blob/main/tests/recipes/test_qwen38_gdn.py) compare exact
 checkpoint execution with the canonical Transformers implementation. The
 serving recipe consumes the prepared b12x operator directly.
 
@@ -773,12 +773,12 @@ a slow configuration. Same-capacity replay is exact for deterministic plans;
 atomic reductions use measured repeatability bounds. Whole-model logit
 distance is diagnostic and cannot select a recurrence policy.
 
-The GDN declaration in [gated_delta.py](../ignition/components/gated_delta.py) restricts
+The GDN declaration in [gated_delta.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/gated_delta.py) restricts
 prefill to `recurrence_policy="sequential_k1"`. Removing that restriction
 requires component and prefix-continuation checks, plus before/after
 prefill throughput and kernel timelines. QSA's declaration uses the library's
 default partition policy. Preparation policy metadata, including the labels in
-[tuning.py](../ignition/recipes/qwen38/tuning.py), must describe the submitted
+[tuning.py](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/qwen38/tuning.py), must describe the submitted
 queries. Controlled arithmetic comparisons belong in
 explicit preparation configuration, carried into the plan and measurements;
 environment-variable switches are prohibited.
@@ -889,7 +889,7 @@ snapshots, and registered transport storage keep explicit owners through native
 drain.
 
 Operator benchmark operands and trial-state arenas live in
-[`preparation/fixtures`](../ignition/preparation/fixtures/). GDN, fused MoE,
+[`preparation/fixtures`](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/fixtures/). GDN, fused MoE,
 hyperconnection, variable-length attention, blockscaled GEMM, and MTP feedback
 each provide a concrete fixture factory. Recipes retain plan declarations,
 selected plans, geometry, and finalizers. Fixture factories preserve checkpoint
@@ -1350,7 +1350,7 @@ ancestor pinning, and eviction preserve ownership across active branches.
 
 The [Rust prefix cache](../helios/src/cache.rs) manages ownership, readiness,
 pinning, and eviction. Helios allocates backing storage when loading the core;
-[captured maintenance operations](../ignition/recipes/qwen38/maintenance.py)
+[captured maintenance operations](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/qwen38/maintenance.py)
 reset, restore, and snapshot its contents.
 
 Use one logical page allocation to identify the corresponding storage across all
@@ -1649,7 +1649,7 @@ the contracts established by the preceding stages.
    preserve CSF, NVFP4, MXFP8, PLE, and activation policy. A dequantized BF16
    model is a diagnostic reference for different arithmetic. Exercise the real
    preparation constructors on tensor metadata without CUDA initialization,
-   using [the bootstrap construction test](../tests/preparation/test_bootstrap_construction.py).
+   using [the bootstrap construction test](https://github.com/TheApathy/hyperflare-recipes/blob/main/tests/preparation/test_bootstrap_construction.py).
 2. **Prepared operators and complete graphs.** Compare components on identical
    operands, then validate metadata preparation, cache writes, sampling,
    arbitrary tails, maintenance, and full-prompt resume. Compile and capture

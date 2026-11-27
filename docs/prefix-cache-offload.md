@@ -82,10 +82,11 @@ emit a standard raw v3 file). Shared-memory, TCP, and RDMA readers advertising
 a matching profile can claim packed records from both manager DRAM and NVMe.
 
 Both `cpu` and `gpu` modes advertise `[ZKV1, GKV1]` receive profiles across
-single-process local tiers, single-process `selene-manager` pools, and
-standalone multi-host `--rank` local disk (the profile handshake rejects
-mismatched rank modes at startup, and multi-host `--rank` +
-`--prefix-cache-pool` rejects active compression at startup):
+single-process local tiers, single-process `selene-manager` pools,
+standalone multi-host `--rank` local disk, and multi-host `--rank` +
+`--prefix-cache-pool` (the profile handshake rejects mismatched rank modes at
+startup; multi-host compressed pools negotiate world-wide v4 layouts across
+ranks):
 
 - In `gpu` mode, new captures encode on GPU as `GKV1`, matrix-predictor and
   large-page (>= 256 KiB) `GKV1` restores decode on GPU (falling back to the

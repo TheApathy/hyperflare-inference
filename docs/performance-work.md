@@ -103,9 +103,9 @@ bounds derived from measured repeatability.
 
 Check graph breaks, escaping output lifetimes, shared scratch, native replay
 allocations, and graph duration. The
-[PLE delivery test](../tests/components/test_ple_delivery_cuda.py) exercises
+[PLE delivery test](https://github.com/TheApathy/hyperflare-recipes/blob/main/tests/components/test_ple_delivery_cuda.py) exercises
 asynchronous delivery; the
-[PLE component tests](../tests/recipes/test_qwen38_ple.py) compare consumer
+[PLE component tests](https://github.com/TheApathy/hyperflare-recipes/blob/main/tests/recipes/test_qwen38_ple.py) compare consumer
 arithmetic across graph variants.
 
 ## Autotuning and kernel bands

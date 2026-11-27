@@ -698,41 +698,72 @@ impl Sharded {
                         .iter()
                         .flatten()
                         .any(offer_has_packet);
+                    let mut packed_error: Option<Error> = None;
                     if any_packet
                         && let (Ok(bytes), Some(header)) = (&result, pending.header.as_ref())
                     {
                         let row = header.row_present(*bytes);
                         if pending.offers[0].is_none()
                             && let Some(path) = pending.path.as_deref()
-                            && let Ok(offer) = offer_from_file(path, header, row)
                         {
-                            pending.offers[0] = offer;
+                            match offer_from_file(path, header, row) {
+                                Ok(offer) => pending.offers[0] = offer,
+                                Err(err) => packed_error = Some(err),
+                            }
                         }
-                        if let Some(offers) = pending
-                            .offers
-                            .iter()
-                            .cloned()
-                            .collect::<Option<Vec<_>>>()
-                        {
-                            let world_ranks = vec![header.ranks[0].clone(); self.ranks()];
-                            let first_page = header
-                                .parent
-                                .map_or(0, |p| p.consumed_tokens / header.page_tokens);
-                            if let Ok(layout) = packed::merge_rank_offers(
-                                &offers,
-                                &world_ranks,
-                                first_page,
-                                header.tail_pages,
-                                row,
-                            ) {
-                                self.world_packed.insert(id, Arc::new(layout));
+                        if packed_error.is_none() {
+                            if let Some(offers) = pending
+                                .offers
+                                .iter()
+                                .cloned()
+                                .collect::<Option<Vec<_>>>()
+                            {
+                                let world_ranks = vec![header.ranks[0].clone(); self.ranks()];
+                                let first_page = header
+                                    .parent
+                                    .map_or(0, |p| p.consumed_tokens / header.page_tokens);
+                                match packed::merge_rank_offers(
+                                    &offers,
+                                    &world_ranks,
+                                    first_page,
+                                    header.tail_pages,
+                                    row,
+                                ) {
+                                    Ok(layout) => {
+                                        self.world_packed.insert(id, Arc::new(layout));
+                                    }
+                                    Err(err) => packed_error = Some(err),
+                                }
+                            } else {
+                                packed_error = Some(invalid(
+                                    "missing packed rank offer while assembling world-wide v4 layout",
+                                ));
                             }
                         }
                     }
-                    TransportEvent::Stored {
-                        id,
-                        result,
-                        header: pending.header,
+                    if let Some(err) = packed_error {
+                        let wrote: Vec<usize> = pending
+                            .results
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, res)| matches!(res, Some(Ok(_))))
+                            .map(|(rank, _)| rank)
+                            .collect();
+                        if let Some(path) = pending.path.filter(|_| !wrote.is_empty()) {
+                            self.remove(&wrote, path, id, err);
+                            return;
+                        }
+                        TransportEvent::Stored {
+                            id,
+                            result: Err(err),
+                            header: pending.header,
+                        }
+                    } else {
+                        TransportEvent::Stored {
+                            id,
+                            result,
+                            header: pending.header,
+                        }
                     }
                 }
                 kind => kind.event(id, result),

@@ -910,22 +910,26 @@ async fn receive_windows(
                 if let Some((_, rank)) = entry.slicing.as_ref().filter(|(l, _)| l.world() > 1) {
                     let rank_u32 = *rank as u32;
                     let expected_len =
-                        flare_selene::shared::packed::rank_window_bytes(manifest, rank_u32);
+                        flare_selene::shared::packed::stored_rank_window_bytes(manifest, rank_u32);
                     if grant.shape.length != expected_len {
                         return Err(invalid("a packed rank window's length is not its slice's"));
                     }
                     for (at, unit) in
-                        flare_selene::shared::packed::leg_units(manifest, Some(rank_u32))
+                        flare_selene::shared::packed::stored_rank_units(manifest, rank_u32)
                     {
                         if unit.stored_length == 0 {
                             continue;
                         }
+                        let dst_offset = grant
+                            .offset
+                            .checked_add(at)
+                            .ok_or_else(|| invalid("packed rank unit offset overflow"))?;
+                        // SAFETY: stored_rank_units partitions unit byte ranges by exclusive
+                        // stored_rank so no two concurrent rank tasks alias the same region slice.
                         let dst = unsafe {
-                            inner.regions.bytes(
-                                grant.region,
-                                grant.offset + at,
-                                unit.stored_length,
-                            )?
+                            inner
+                                .regions
+                                .bytes(grant.region, dst_offset, unit.stored_length)?
                         };
                         within(
                             IO_TIMEOUT,

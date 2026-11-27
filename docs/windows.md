@@ -93,11 +93,11 @@ Rebuild and run native tests from any configured PowerShell:
 
 Setup supports ARM64 and x64 paths; validate each architecture on its own host.
 It does not download model weights or establish complete-model GPU correctness.
-Not qualified: the `selene` test suite on Windows. Its process nonce source
-(`selene/src/shared/identity.rs`) opens `/dev/urandom`, which Windows does not
-provide, and its cache read-ahead tests can stall on ARM64. Report those
-failures separately from build and CLI check results when validating native
-changes.
+Not qualified: full `selene` test-suite qualification on Windows ARM64. Its
+process nonce source (`selene/src/shared/identity.rs`) now uses Windows
+`BCryptGenRandom` (`BCRYPT_USE_SYSTEM_PREFERRED_RNG`), though cache read-ahead
+tests remain unqualified on ARM64. Report any `selene` failures separately from
+build and CLI check results when validating native changes.
 
 For a manually provisioned environment, follow these requirements:
 

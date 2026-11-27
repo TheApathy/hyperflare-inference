@@ -42,8 +42,9 @@ RUN apt-get update \
         --shell /usr/sbin/nologin flare
 
 COPY --from=build /out/flare /usr/local/bin/flare
-COPY LICENSE NOTICE /usr/share/doc/flare/
-COPY helios/licenses/PyTorch.txt /usr/share/doc/flare/licenses/PyTorch.txt
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/doc/flare/
+COPY third_party/rust/ /usr/share/doc/flare/third_party/rust/
+COPY helios/licenses/ /usr/share/doc/flare/licenses/
 
 USER flare
 WORKDIR /home/flare

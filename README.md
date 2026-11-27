@@ -2,6 +2,8 @@
   <img src="docs/images/hyperflare.png" alt="Flare — ASCII wordmark above a supermassive solar flare" width="912">
 </p>
 
+> **Community Fork Notice:** This repository (`TheApathy/hyperflare-inference`) is an independent community fork of [`NVIDIA/hyperflare-inference`](https://github.com/NVIDIA/hyperflare-inference), paired with the companion recipes fork [`TheApathy/hyperflare-recipes`](https://github.com/TheApathy/hyperflare-recipes) (forked from [`local-inference-lab/hyperflare-recipes`](https://github.com/local-inference-lab/hyperflare-recipes)). Fork additions include integrated UMA compile-pool sizing and streaming compiled capture, exposed-handoff pricing, non-terminal prefill pipelining, scheduler cold-checkpoint prior / prefill-priority / per-batch speculative-width controls, multi-host compressed Selene pool records and pool-only startup, GPU KV restore CRC verification, Unix `io_uring` Engram lane fanout, Windows CSPRNG identity generation, and hardened CI workflows.
+>
 > **Coding agents:** skip this README and read [AGENTS.md](AGENTS.md) directly.
 
 Hyperflare is a local inference server for NVIDIA SM120/SM121 GPUs, built for
@@ -32,8 +34,9 @@ The design rests on a few principles:
 - **Keep the runtime small and shared.** Model recipes own model computation;
   the runtime owns scheduling, cache storage, and request handling. Core
   Ignition in this repository provides the recipe-free preparation library and
-  CLI runner; official model recipes and reusable b12x model components live in
-  [local-inference-lab/hyperflare-recipes](https://github.com/local-inference-lab/hyperflare-recipes).
+  CLI runner; model recipes and reusable b12x model components live in
+  [TheApathy/hyperflare-recipes](https://github.com/TheApathy/hyperflare-recipes)
+  (upstream: [local-inference-lab/hyperflare-recipes](https://github.com/local-inference-lab/hyperflare-recipes)).
   A focused hardware and kernel stack keeps those boundaries manageable.
 
 [vLLM](https://docs.vllm.ai/en/latest/) covers a much broader range of models,
@@ -45,8 +48,9 @@ Think of Hyperflare as a specialized option when its hardware and model coverage
 fit your machine.
 
 Start with [model preparation and serving](docs/model-preparation.md) and the
-official model recipes in
-[local-inference-lab/hyperflare-recipes](https://github.com/local-inference-lab/hyperflare-recipes).
+companion model recipes in
+[TheApathy/hyperflare-recipes](https://github.com/TheApathy/hyperflare-recipes)
+(upstream: [local-inference-lab/hyperflare-recipes](https://github.com/local-inference-lab/hyperflare-recipes)).
 For native Windows development and serving prebuilt model cores, follow
 [Windows serving](docs/windows.md#build-and-test-on-windows).
 See the [CLI guide](docs/cli-design.md) for configuration and the

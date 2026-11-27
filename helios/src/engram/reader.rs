@@ -448,14 +448,18 @@ impl UnixLane {
                 .offset(read.offset)
                 .build()
                 .user_data(slot as u64);
-                unsafe { self.ring.submission().push(&entry) }
-                    .map_err(|_| "Engram submission queue full")?;
+                if unsafe { self.ring.submission().push(&entry) }.is_err() {
+                    failure = Some("Engram submission queue full".to_string());
+                    break;
+                }
                 self.slot_read[slot] = next_read;
                 next_read += 1;
                 in_flight += 1;
                 submitted_bytes += read.nbytes as u64;
             }
-            stats.disk_reads.fetch_add(initial as u64, Ordering::Relaxed);
+            stats
+                .disk_reads
+                .fetch_add(in_flight as u64, Ordering::Relaxed);
             stats
                 .disk_bytes
                 .fetch_add(submitted_bytes, Ordering::Relaxed);
@@ -521,8 +525,10 @@ impl UnixLane {
                     .offset(read.offset)
                     .build()
                     .user_data(slot as u64);
-                    unsafe { self.ring.submission().push(&entry) }
-                        .map_err(|_| "Engram submission queue full")?;
+                    if unsafe { self.ring.submission().push(&entry) }.is_err() {
+                        failure = Some("Engram submission queue full".to_string());
+                        break;
+                    }
                     self.slot_read[slot] = next_read;
                     next_read += 1;
                     in_flight += 1;

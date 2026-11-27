@@ -2,14 +2,19 @@ name: Native serving
 
 on:
   push:
-    branches: [main, feature/windows-serving]
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions: {}
 
 jobs:
   native:
+    timeout-minutes: 60
     permissions:
       contents: read
     strategy:
@@ -75,6 +80,7 @@ jobs:
           FLARE_TEST_TEMPLATE_DIR: ${{ runner.temp }}/flare-test-templates
         run: cargo test --locked --release --manifest-path flare-cli/Cargo.toml
       - name: Test shared application workflows
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           FLARE_TEST_TEMPLATE_DIR: ${{ runner.temp }}/flare-test-templates
         run: cargo test --locked --release --manifest-path flare/Cargo.toml --target-dir flare-cli/target
@@ -103,6 +109,7 @@ jobs:
 
   rdma:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -121,6 +128,7 @@ jobs:
 
   python-boundary-and-hygiene:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -132,7 +140,6 @@ jobs:
           python-version: '3.12'
       - name: Check shell and Python syntax
         run: |
-          bash -n scripts/build_deb.sh
           git ls-files -z '*.sh' | xargs -0 -n 1 bash -n
           git ls-files -z '*.py' | xargs -0 python -m py_compile
       - name: Install Heliopause build dependencies

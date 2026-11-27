@@ -1192,6 +1192,11 @@ impl Core {
                     ) else {
                         return bad(self, v2::ClaimReason::CopyError);
                     };
+                    if descriptor.ranks.len() > 1
+                        && offer.units.iter().any(|u| !u.replicas.is_empty())
+                    {
+                        return bad(self, v2::ClaimReason::CopyError);
+                    }
                     if record.row != (layout.row_bytes() != 0) {
                         return bad(self, v2::ClaimReason::CopyError);
                     }

@@ -356,7 +356,8 @@ pub fn verify_units(units: &[PackedUnit], bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Select the rank's units while retaining their offsets in the shared extent.
+/// Select the rank's units while retaining their offsets in the shared extent
+/// (including replicated units for read/restore paths).
 pub fn leg_units(
     window: &super::wire::PackedWindow,
     rank: Option<u32>,
@@ -372,9 +373,33 @@ pub fn leg_units(
         .filter(move |(_, u)| rank.is_none_or(|r| r == u.stored_rank || u.replicas.contains(&r)))
 }
 
-/// Stored bytes belonging to `rank` inside a world-wide packed window.
+/// Select only units whose canonical `stored_rank` equals `rank` (for exclusive
+/// write/put paths so replicated units are never written concurrently by two ranks).
+pub fn stored_rank_units(
+    window: &super::wire::PackedWindow,
+    rank: u32,
+) -> impl Iterator<Item = (u64, &PackedUnit)> {
+    window
+        .units
+        .iter()
+        .scan(0u64, |offset, u| {
+            let at = *offset;
+            *offset = at.checked_add(u.stored_length)?;
+            Some((at, u))
+        })
+        .filter(move |(_, u)| u.stored_rank == rank)
+}
+
+/// Stored bytes belonging to `rank` inside a world-wide packed window (read/restore view).
 pub fn rank_window_bytes(window: &super::wire::PackedWindow, rank: u32) -> u64 {
     leg_units(window, Some(rank))
+        .map(|(_, u)| u.stored_length)
+        .sum()
+}
+
+/// Stored bytes canonically owned by `rank` (`stored_rank == rank`) for exclusive writes.
+pub fn stored_rank_window_bytes(window: &super::wire::PackedWindow, rank: u32) -> u64 {
+    stored_rank_units(window, rank)
         .map(|(_, u)| u.stored_length)
         .sum()
 }
@@ -388,17 +413,23 @@ pub fn scatter_rank_units(
     src: &[u8],
 ) -> Result<()> {
     let mut cursor = 0usize;
-    for (at, unit) in leg_units(window, Some(rank)) {
+    for (at, unit) in stored_rank_units(window, rank) {
         let len = usize::try_from(unit.stored_length).map_err(|_| invalid("packed unit length"))?;
         let at = usize::try_from(at).map_err(|_| invalid("packed unit offset"))?;
+        let cursor_end = cursor
+            .checked_add(len)
+            .ok_or_else(|| invalid("packed rank slice offset overflow"))?;
+        let at_end = at
+            .checked_add(len)
+            .ok_or_else(|| invalid("packed rank unit offset overflow"))?;
         let from = src
-            .get(cursor..cursor + len)
+            .get(cursor..cursor_end)
             .ok_or_else(|| invalid("packed rank slice is shorter than its manifest"))?;
         let to = dst
-            .get_mut(at..at + len)
+            .get_mut(at..at_end)
             .ok_or_else(|| invalid("packed rank unit lies outside the shared window"))?;
         to.copy_from_slice(from);
-        cursor += len;
+        cursor = cursor_end;
     }
     if cursor != src.len() {
         return Err(invalid("packed rank slice has trailing bytes"));

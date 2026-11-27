@@ -995,6 +995,7 @@ mod surplus_tests {
     }
 
     #[test]
+    #[ignore = "microbenchmark; run in --release with -- --ignored --nocapture"]
     fn microbench_surplus_history_build_table() {
         let history = populated_history();
         const COLD_ITERS: u32 = 2_000;

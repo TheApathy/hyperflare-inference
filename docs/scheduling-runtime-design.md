@@ -623,6 +623,9 @@ Defaults specify these preferences:
 | `adaptation_ms` | 100 | Service-price adaptation time |
 | `estimate_ttl_ns` | 30,000,000,000 | Timing freshness interval |
 | `adaptive_verification_alpha` | 1 | Exponent on prefix-survival estimates in speculative selection scores |
+| `cold_checkpoint_prior` | `false` | Permit optional checkpoint captures before measured timing estimates exist (`--scheduler-cold-checkpoint-prior`) |
+| `prefill_priority` | `1.0` | Positive finite multiplier on prefill utility (`--scheduler-prefill-priority`) |
+| `speculative_width_by_batch` | `[None; 7]` | Optional fixed speculative width per power-of-two batch `1..64` (`--scheduler-spec-width-by-batch`) |
 
 These weights express a throughput/cadence tradeoff. They are not graph timing
 measurements or latency guarantees. Setting fairness or age coefficients to zero

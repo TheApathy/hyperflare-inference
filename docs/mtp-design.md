@@ -66,12 +66,12 @@ The MTP decoder has no GDN or PLE layer. Target verification executes all
 
 MTP expert preparation must preserve W4A16 arithmetic. The target expert loader
 uses activation-quantized NVFP4 with CSF scales and cannot be applied unchanged.
-The [checkpoint manifest](../ignition/preparation/qwen38.py) validates MTP
+The [checkpoint manifest](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/qwen38/recipe.py) validates MTP
 tensor geometry. Target loading excludes those tensors; the separate
-[MTP loader](../ignition/recipes/qwen38/mtp_weights.py) prepares their weights.
+[MTP loader](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/qwen38/mtp_weights.py) prepares their weights.
 
 Transformers 5.23.0, the release pinned in `pyproject.toml`, ignores `mtp.*`
-checkpoint keys and has no MTP module. The [MTP recipe](../ignition/recipes/qwen38/mtp.py) composes
+checkpoint keys and has no MTP module. The [MTP recipe](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/qwen38/mtp.py) composes
 b12x operators for feedback, attention, expert execution, and output mixing.
 Feedback arithmetic is checked against `b12x.sequence.mtp_feedback.reference`;
 state alignment and graph replay are exercised by the recipe tests.
@@ -101,7 +101,7 @@ accepted next-token IDs.
 | Stochastic chain verification | `flashinfer.sampling.chain_speculative_sampling` | Draft probabilities `[B,K,V]`, target probabilities `[B,K+1,V]`; explicit device RNG |
 
 GDN's ordinary checkpoint path supports Qwen's 16 key heads and 48 value heads.
-Ignition's [GDN recovery component](../ignition/components/gdn_recovery.py) also
+Ignition's [GDN recovery component](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/components/gdn_recovery.py) also
 supports that geometry: verification retains correction vectors, normalized keys
 and decays, and commit replays only the accepted prefix into the live recurrent
 row. The Qwen recipe uses this path for wider rounds and updates the live state
@@ -116,7 +116,7 @@ there is no private eager model fallback.
 
 ## GLM learned proposals and continuation state
 
-The [GLM MTP layer](../ignition/recipes/glm53/mtp.py) loads
+The [GLM MTP layer](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/glm53/mtp.py) loads
 `model.language_model.layers.45`. It combines the shared token embedding with
 the normalized target output through separate RMS norms and an 8192-to-4096
 projection. The decoder uses indexed MLA and ordinary residuals, followed by
@@ -145,7 +145,7 @@ sampling, and commit execute inside prepared CUDA graphs.
 
 ## DeepSeek DSpark proposals and continuation state
 
-The [DSpark preparation code](../ignition/recipes/deepseek41/dspark.py) composes
+The [DSpark preparation code](https://github.com/TheApathy/hyperflare-recipes/blob/main/hyperflare_recipes/recipes/deepseek41/dspark.py) composes
 three draft layers with a noncausal block sized to the preparation's draft-token
 maximum, seven by default. The five draft positions described in
 the [DeepSeek-V4.1 report](https://arxiv.org/html/2609.19969v1#S2.SS4.SSS3)
@@ -287,7 +287,7 @@ The compact recurrence (`PreparedRecoveredRecurrence` in
 `ignition/components/gdn_recovery.py`) retains one committed matrix plus per-token
 correction vectors, normalized keys and decay records. `PreparedGDNCommit`
 applies accepted updates before the following round or checkpoint publication.
-The [recovery tests](../tests/recipes/test_qwen38_gdn_recovery_cuda.py) compare
+The [recovery tests](https://github.com/TheApathy/hyperflare-recipes/blob/main/tests/recipes/test_qwen38_gdn_recovery_cuda.py) compare
 this arithmetic with b12x checkpointed decode. Full checkpoint columns are
 the component reference. A capacity or write-traffic saving claimed for the
 compact recurrence requires complete-round measurements.
@@ -582,7 +582,7 @@ establish SM121 execution or performance.
 
 ### Workload and paired performance measurements
 
-The [serving performance corpus](../qualify/performance.py) uses exact-length
+The [serving performance corpus](https://github.com/TheApathy/hyperflare-recipes/blob/main/qualify/performance.py) uses exact-length
 numbered-list requests padded with repeated `apple` tokens. It measures serving
 shapes, cache paths and replay overhead; it does not establish representative
 MTP acceptance or speedup.

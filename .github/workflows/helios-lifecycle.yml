@@ -1,6 +1,15 @@
 name: Helios lifecycle
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'helios/**'
+      - 'selene/**'
+      - 'selene-manager/**'
+      - 'eos/**'
+      - 'verification/helios-lifecycle/**'
+      - '.github/workflows/helios-lifecycle.yml'
   pull_request:
     paths:
       - 'helios/**'
@@ -11,11 +20,16 @@ on:
       - '.github/workflows/helios-lifecycle.yml'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions: {}
 
 jobs:
   lifecycle:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -38,6 +52,7 @@ jobs:
 
   kani:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:

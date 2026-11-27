@@ -252,7 +252,7 @@ impl CompletionRecords {
                     0,
                 );
             } else {
-                let _ = record.fields();
+                panic!("completion serialization requires a token vector");
             }
         }
     }
@@ -2079,6 +2079,7 @@ mod hotpath_microbench_tests {
     }
 
     #[test]
+    #[ignore = "microbenchmark; run in --release with -- --ignored --nocapture"]
     fn microbench_validate_uploads_and_decode_records_64_lanes() {
         let manifest = manifest_64_lanes();
         manifest.validate().unwrap();

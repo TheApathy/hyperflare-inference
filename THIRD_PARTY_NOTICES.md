@@ -51,15 +51,17 @@ FlashInfer/b12x source. Its upstream Apache-2.0 license
 is retained in `helios/licenses/FlashInfer.txt` and included in binary archives.
 This native C source is distinct from the separately installed Python package.
 
-The vLLM-derived sampler and DeepSeek recipe assets belong to the source and
-preparation tools. Their existing notices and license texts remain in the source
-tree. They are not part of the native executable's dependency graph.
+The vLLM-derived sampler and DeepSeek recipe assets live in the separate
+recipes repository (`TheApathy/hyperflare-recipes` /
+`local-inference-lab/hyperflare-recipes`), where their notices and license
+texts are retained. They are not part of the native executable's dependency
+graph.
 
 ## Preparation and build dependencies
 
-`pyproject.toml` and `uv.lock` describe the separately installed preparation and
-test environment, including PyTorch, Transformers, FlashInfer/b12x, CUDA Python
-bindings, and NVIDIA CUDA wheels. Heliopause is a native extension used by that
+`pyproject.toml` (and `uv.lock` in the companion recipes repository) describe
+the separately installed preparation and test environment, including PyTorch,
+Transformers, FlashInfer/b12x, CUDA Python bindings, and NVIDIA CUDA wheels. Heliopause is a native extension used by that
 Python preparation environment, not a shipped runtime library. These packages
 are installed from their own distributions and retain their own license terms.
 They must be included in a source-repository review, but are not bundled into

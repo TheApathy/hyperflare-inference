@@ -491,7 +491,7 @@ recipes default to 32 concurrent requests and 128 target-token rows.
 Qwen3.8 Flash and GLM 5.3 use rectangular catalogs covering five
 drafts through batch 16 and three at batch 32. Step-5's rectangular catalog
 covers its full three-draft depth at batch 32. Qwen3.8 27B, DeepSeek V4/V4.1,
-MiMo V2.6 Pro, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, MiniMax M3.1, and Muse
+MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, MiniMax M3.1, and Muse
 Spark use packed catalogs with a default
 budget of 64 round graphs plus width-one continuations. Each recipe selects
 its proposal and prefix-allocation mode.
@@ -500,7 +500,7 @@ prefill chunk, 128 physical target rows, and at most 64 packed round graphs,
 with packed GPU prefix selection.
 Its catalog contains combined proposal/allocation/verification rounds and
 width-one graphs; ordinary graphs serve `--mtp-draft-tokens 0`.
-The [model preparation guide](model-preparation.md#deepseek-v41-flash) defines
+The [model preparation guide](https://github.com/TheApathy/hyperflare-recipes/blob/main/docs/model-preparation.md#deepseek-v41-flash) defines
 the packed capacity selection. The row cap bounds target work and storage;
 raising it permits longer aggregate prefixes at larger batches. The independent
 graph budget controls catalog density between each batch's smallest wider round
@@ -674,8 +674,9 @@ for final native performance validation: development ranks run in separate
 processes with separate delivery staging, while the native CLI shares staging
 between its rank threads.
 
-For export, conversion, and native serving, use the
-[DeepSeek V4.1 workflow](model-preparation.md#deepseek-v41-flash).
+For export, conversion, and native serving, see the
+[DeepSeek V4.1 workflow](https://github.com/TheApathy/hyperflare-recipes/blob/main/docs/model-preparation.md#deepseek-v41-flash)
+in the companion recipes repository.
 [Re-exporting with cached weights](model-preparation.md#re-exporting-with-cached-weights)
 shows how to rebuild a compatible core with `--reuse-weights`.
 
@@ -752,6 +753,9 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--prefix-cache-disk DIR` | Directory for prefix checkpoints and prepared inputs on disk | `[paths] prefix_cache`, otherwise disabled |
 | `--prefix-cache-disk-limit SIZE` | Disk retention limit, such as `100G`; `0` disables | `[prefix_cache] disk_limit`, otherwise 10% of free space |
 | `--prefix-cache-drain-on-shutdown[=DURATION\|on\|off]` | Drain host-memory records to local disk or to the pool at shutdown, optionally bounded by a duration such as `90s` or `2m`; the bare flag means `on`, and a value requires `=` | `[prefix_cache] drain_on_shutdown`, otherwise `off` |
+| `--scheduler-cold-checkpoint-prior` | Allow optional checkpoint captures before measured timing costs exist | `[scheduler] cold_checkpoint_prior`, otherwise `false` |
+| `--scheduler-prefill-priority FACTOR` | Positive finite multiplier on prefill utility relative to decode | `[scheduler] prefill_priority`, otherwise `1.0` |
+| `--scheduler-spec-width-by-batch SPEC` | Comma-separated `BATCH:WIDTH` pairs pinning speculative width per power-of-two batch (`1..64`) | `[scheduler] spec_width_by_batch`, otherwise unset |
 | `--prefix-cache-max-age DURATION\|off` | Expire host records by time since last use | `[prefix_cache] max_age`, otherwise `off` |
 
 The table omits flags specified elsewhere: `--config`, the scheduler flags above,
@@ -1316,9 +1320,9 @@ An absent default file supplies no overrides; an explicitly selected missing
 file or an invalid runtime setting is an error. Help does not read the file.
 
 Native `flare run` applies `[server] host`, `port`, `api_key`, `thinking_token_budget`,
-and `scheduler_checkpoint_extra_work_fraction`,
-`[memory] reserve`, `[defaults] max_concurrency`, `[models.<name>] max_concurrency`, all `[prefix_cache]`
-settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
+and `scheduler_checkpoint_extra_work_fraction`, `[scheduler]` (`cold_checkpoint_prior`,
+`prefill_priority`, `spec_width_by_batch`), `[memory] reserve`, `[defaults] max_concurrency`,
+`[models.<name>] max_concurrency`, all `[prefix_cache]` settings, and `[paths] prefix_cache`. Prepared-model acquisition and cache commands
 use `[paths] core_cache`. Flags override these defaults, including explicit
 zero limits and values equal to the built-in defaults. An empty `--api-key-file`
 disables configured authentication; API keys are never forwarded as arguments.
@@ -1360,6 +1364,11 @@ max_concurrency = 4
 [memory]
 reserve = "0"                     # GPU memory left for processes started later.
 
+[scheduler]
+# cold_checkpoint_prior = false   # Allow optional captures before measured costs exist.
+# prefill_priority = 1.0          # Positive finite prefill utility multiplier.
+# spec_width_by_batch = "1:8,2:4" # Per-batch fixed speculative widths (power-of-two batch 1..64).
+
 [prefix_cache]
 memory = ""                      # Warm checkpoints and CPU inputs; empty or 0: no warm tier. Intake is additional.
 drain_on_shutdown = "off"         # Pooled DRAM persistence: on, off, or a duration.
@@ -1380,9 +1389,13 @@ cuda = "/opt/cuda"                # Explicit CUDA toolkit directory for native b
 ```
 
 Ignition keeps the configuration file schema static and host-oriented, and
-rejects any section or key outside it. `[defaults]` accepts `model` and
+rejects any section or key outside it (`[server]`, `[scheduler]`, `[defaults]`,
+`[preparation]`, `[memory]`, `[prefix_cache]`, `[models.<alias>]`, `[paths]`,
+`[publishing]`). `[defaults]` accepts `model` and
 `max_concurrency`; `[models.<alias>]` accepts `max_concurrency`; `[preparation]`
-accepts `compile_workers`, `autotune_effort`, and `checkpoint_token_file`.
+accepts `compile_workers`, `autotune_effort`, and `checkpoint_token_file`;
+`[scheduler]` accepts `cold_checkpoint_prior`, `prefill_priority`, and
+`spec_width_by_batch`.
 Recipe preparation options—including image concurrency, speculation method,
 token capacity, graph budget, quantization, and layout flags—are controlled by
 the recipe's `RecipeParameters` defaults and explicit command-line flags rather

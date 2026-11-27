@@ -282,11 +282,11 @@ subranges into a free host frame, enqueues asynchronous uploads and graph
 execution, records a production event, and queues the completion transfer on
 the copy stream behind that event. Omitted input ranges preserve device state.
 `poll` returns ordered `FrameCompletion` records after transfer completion and
-then permits frame reuse. Only ordinary decode and complete speculative
-generation can share the two-frame window; other operations drain it. A third
-submission receives backpressure; a grammar submission requires an empty window and blocks further submissions until its
-completion is consumed. The direct executor has no Python calls or per-step
-CUDA allocation.
+then permits frame reuse. Ordinary decode, complete speculative generation, and
+strictly non-terminal prefill can share the two-frame window; other operations
+drain it. A third submission receives backpressure; a grammar submission requires
+an empty window and blocks further submissions until its completion is consumed.
+The direct executor has no Python calls or per-step CUDA allocation.
 
 Tensor-parallel coordination counts preparing steps, enqueued steps, and
 unconsumed all-rank completions against the same two-slot bound. Prepare and
@@ -376,7 +376,9 @@ a distinct prompt end compete within a work allowance of
 defaulting to 0.05. Extra captures charge snapshot-copy cost and additional prefill
 caused by splitting chunks. Productive completed decode earns the same fraction
 of measured time for a distinct terminal capture. Unknown costs exclude extras
-while preserving best-effort anchor retention. There is no capture-count cap or
+by default unless `--scheduler-cold-checkpoint-prior` (or
+`[scheduler].cold_checkpoint_prior = true`) is enabled, while preserving
+best-effort anchor retention. There is no capture-count cap or
 per-request share of snapshot rows. The global allocator accounts for snapshot
 aliases, guards a later anchor against earlier optional captures, and reclaims
 unused guards for mandatory execution. Only obtainable capture destinations

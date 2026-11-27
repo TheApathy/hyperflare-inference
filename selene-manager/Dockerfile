@@ -13,6 +13,7 @@ COPY eos/Cargo.toml ./eos/
 COPY eos/src ./eos/src
 COPY selene/Cargo.toml selene/build.rs ./selene/
 COPY selene/src ./selene/src
+COPY selene/tests ./selene/tests
 COPY selene/examples ./selene/examples
 COPY selene/proto ./selene/proto
 COPY selene-manager/Cargo.toml selene-manager/Cargo.lock ./selene-manager/
@@ -22,5 +23,10 @@ WORKDIR /build/selene-manager
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
+RUN groupadd --gid 10001 selene \
+    && useradd --uid 10001 --gid selene --create-home --no-log-init \
+        --shell /usr/sbin/nologin selene
 COPY --from=build /build/selene-manager/target/release/selene /usr/local/bin/selene
+COPY LICENSE NOTICE /usr/share/doc/selene/
+USER selene
 ENTRYPOINT ["/usr/local/bin/selene"]

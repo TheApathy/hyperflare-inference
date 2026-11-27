@@ -10,8 +10,9 @@ Each rung uses the real component below it and adds one class of risk. All of th
 Linux CPU host against a real manager; the pool tests drive it with a minimal wire-level
 client (`tests/support/pool.rs`) and never model the manager's state machine.
 
-`tests/` paths in this document are relative to `selene-manager/`. The `selene` crate has unit
-tests only: `selene/tests/` holds record fixtures and no test targets.
+`tests/` paths in this document are relative to `selene-manager/`. The `selene` crate carries unit
+tests plus the `sharded_partial_failure` integration test under `selene/tests/` alongside record
+fixtures.
 
 | Suite | What it proves |
 |---|---|

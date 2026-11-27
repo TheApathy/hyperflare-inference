@@ -2,6 +2,11 @@
 !Dockerfile
 !LICENSE
 !NOTICE
+!THIRD_PARTY_NOTICES.md
+!third_party/
+third_party/**
+!third_party/rust/
+!third_party/rust/**
 !flare/
 flare/**
 !flare/Cargo.toml
@@ -25,7 +30,7 @@ helios/**
 !helios/native/
 !helios/native/**
 !helios/licenses/
-!helios/licenses/PyTorch.txt
+!helios/licenses/*.txt
 !eos/
 eos/**
 !eos/Cargo.toml
@@ -45,9 +50,12 @@ selene/**
 !selene/native/**
 !selene/src/
 !selene/src/**
+!selene/tests/
+!selene/tests/**
 !selene-manager/
 selene-manager/**
 !selene-manager/Cargo.toml
+!selene-manager/Cargo.lock
 !selene-manager/tests/
 !selene-manager/tests/**
 !selene-manager/src/

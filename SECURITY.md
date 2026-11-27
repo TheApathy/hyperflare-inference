@@ -2,21 +2,24 @@
 
 ## Reporting a vulnerability
 
-Report suspected security vulnerabilities in Flare privately to the
-[NVIDIA Product Security Incident Response Team (PSIRT)](https://www.nvidia.com/en-us/security/report-vulnerability/).
-Use the vulnerability disclosure program linked on that page, or email
-[psirt@nvidia.com](mailto:psirt@nvidia.com). For email reports, encrypt the
-message using the NVIDIA public PGP key linked from the reporting page.
+This repository (`TheApathy/hyperflare-inference`) is an independent community
+fork of [`NVIDIA/hyperflare-inference`](https://github.com/NVIDIA/hyperflare-inference).
 
-Do not disclose security vulnerabilities in public GitHub issues, discussions,
-or pull requests.
+- **Vulnerabilities in fork-specific changes** (scheduler policies, Selene
+  multi-host compression, UMA compile/capture, Engram `io_uring` fanout, or
+  fork packaging): report privately via **GitHub Private Vulnerability
+  Reporting** on `TheApathy/hyperflare-inference` (Security → Advisories →
+  Report a vulnerability). Do **not** open public GitHub issues, discussions, or
+  pull requests for undisclosed vulnerabilities.
+- **Vulnerabilities in upstream `NVIDIA/hyperflare-inference`:** report
+  privately to the
+  [NVIDIA Product Security Incident Response Team (PSIRT)](https://www.nvidia.com/en-us/security/report-vulnerability/)
+  or email [psirt@nvidia.com](mailto:psirt@nvidia.com) encrypted with NVIDIA's
+  public PGP key (see [NVIDIA's PSIRT policies](https://www.nvidia.com/en-us/security/psirt-policies/)).
 
-Include the affected Flare version or commit, relevant configuration, a
-description of the vulnerability and its potential impact, and reproduction
-steps or proof-of-concept code.
-
-See [NVIDIA's PSIRT policies](https://www.nvidia.com/en-us/security/psirt-policies/)
-for information about vulnerability handling and disclosure.
+Include the affected commit SHA, relevant configuration, a description of the
+vulnerability and its potential impact, and reproduction steps or
+proof-of-concept code.
 
 ## Model core integrity
 

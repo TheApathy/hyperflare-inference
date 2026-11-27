@@ -134,7 +134,9 @@ def _capture_one(name, function, *, is_compiled, device, stream, warm, pool, ses
         error.add_note(f"Graph {name!r} on {device}: {memory_detail()}")
         raise
     if is_compiled and not retain_forwards:
-        function.retire_after_capture()
+        retire = getattr(function, "retire_after_capture", None)
+        if retire is not None:
+            retire()
     stage.update(advance=1)
     if progress is not None:
         cached = " (compiled cache hit)" if is_compiled and function.cache_hit else ""

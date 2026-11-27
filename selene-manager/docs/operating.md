@@ -383,9 +383,9 @@ The root holds one directory per model identity and layout fingerprint, named
 fingerprint. Remove one such
 directory to drop that model's durable records, or all of them to clear the pool, only while the
 manager is stopped. A changed model identity or layout fingerprint selects a different directory, so
-the directory it leaves unused is safe to delete. The pool name is not part of the directory name or
-the record header: a manager started with a different `--name` on the same root recovers the records
-in that root under its own name.
+the directory it leaves unused is safe to delete. Each root carries a `.selene-pool` ownership marker
+recording its pool `--name`; starting a manager with a different `--name` on the same root is
+rejected at startup to prevent accidental cross-pool attachment.
 
 ## Troubleshooting
 

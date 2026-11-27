@@ -638,7 +638,7 @@ def allocation_order(names, sizes, coordinator=None):
     """Order compiled forwards by largest allocation request, agreed across ranks."""
     names = tuple(names)
     ranks = [(names, sizes)]
-    if coordinator is not None:
+    if coordinator is not None and len(names) > 1 and hasattr(coordinator, "group"):
         import torch.distributed as dist
 
         ranks = [None] * len(coordinator.ranks)

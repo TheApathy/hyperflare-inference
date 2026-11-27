@@ -75,7 +75,7 @@ impl Outbound {
                 match (packed, scatter) {
                     (Some(manifest), Some(_)) => {
                         let rank_bytes =
-                            crate::shared::packed::rank_window_bytes(&manifest, 0) as usize;
+                            crate::shared::packed::stored_rank_window_bytes(&manifest, 0) as usize;
                         let mut slice = vec![0u8; rank_bytes];
                         let sums = work(&mut slice)?;
                         crate::shared::packed::scatter_rank_units(&manifest, 0, dst, &slice)?;
