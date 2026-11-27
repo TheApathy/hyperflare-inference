@@ -86,14 +86,16 @@ impl Readers {
             address: output.as_mut_ptr() as usize,
             len: output.len(),
         };
-        // Small gathers stay on the existing delivery thread. Large gathers use
-        // scoped helpers; their startup cost is included in measured gather time.
-        if self.lanes.len() == 1 || reads.len() <= DEPTH {
+        // Small gathers that fit inside a single lane's window stay on the delivery
+        // thread. Larger gathers fan out only across the lanes needed to cover them.
+        let lane_depth = DEPTH / self.lanes.len();
+        if self.lanes.len() == 1 || reads.len() <= lane_depth {
             return self.lanes[0].gather(reads, fragments, output, stats);
         }
-        let chunk = reads.len().div_ceil(self.lanes.len());
+        let active_lanes = self.lanes.len().min(reads.len().div_ceil(lane_depth));
+        let chunk = reads.len().div_ceil(active_lanes);
         std::thread::scope(|scope| {
-            let (local, helpers) = self.lanes.split_first_mut().unwrap();
+            let (local, helpers) = self.lanes[..active_lanes].split_first_mut().unwrap();
             let mut jobs = reads.chunks(chunk);
             let first = jobs.next().unwrap();
             let mut joins = Vec::with_capacity(helpers.len());
