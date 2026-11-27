@@ -94,6 +94,13 @@ impl CapturePlan {
     }
 }
 
+/// Cold-start per-token prefill duration prior (400 us/token) used when
+/// `PolicyConfig::cold_checkpoint_prior` is enabled and no prefill capacity is measured yet.
+const COLD_PREFILL_NS_PER_TOKEN: u64 = 400_000;
+/// Cold-start single-lane snapshot duration prior (500 us) used when
+/// `PolicyConfig::cold_checkpoint_prior` is enabled and `GraphKind::Snapshot` is unmeasured.
+const COLD_SNAPSHOT_NS: u64 = 500_000;
+
 fn allowance(work: u64, fraction: f64) -> u64 {
     ((work as f64) * fraction).floor().min(u64::MAX as f64) as u64
 }
@@ -184,6 +191,24 @@ impl RequestScheduler {
             .fold(0usize, usize::saturating_add)
     }
 
+    /// Single-lane snapshot copy duration for checkpoint budgeting.
+    /// When `cold_checkpoint_prior` is enabled and no fresh measurement exists,
+    /// falls back to the retained measurement or the 500 us cold prior.
+    fn snapshot_copy_cost_ns(&self) -> Option<u64> {
+        if let Some(nanos) = self.costs.fresh_duration(GraphKind::Snapshot, 1) {
+            return Some(nanos);
+        }
+        if !self.policy.cold_checkpoint_prior {
+            return None;
+        }
+        Some(
+            self.costs
+                .duration(GraphKind::Snapshot, 1, 1)
+                .filter(|&nanos| nanos != 0)
+                .unwrap_or(COLD_SNAPSHOT_NS),
+        )
+    }
+
     /// Each prefill capacity this request can use, with its measured non-terminal and terminal
     /// costs when known and nonzero. Selection reads the costs once instead of once per chunk of
     /// every interval.
@@ -195,7 +220,7 @@ impl RequestScheduler {
         };
         let has_terminal_catalog =
             !request.prompt_logprobs && !self.terminal_prefill_catalog.is_empty();
-        catalog
+        let mut entries: Vec<PrefillCatalogCost> = catalog
             .iter()
             .map(|&capacity| {
                 // Prefill dispatch retains measured costs after expiry; aging alone
@@ -229,7 +254,31 @@ impl RequestScheduler {
                     terminal_ns,
                 }
             })
-            .collect()
+            .collect();
+        if self.policy.cold_checkpoint_prior {
+            let ns_per_token = entries
+                .iter()
+                .filter_map(|entry| {
+                    let nanos = match (entry.non_terminal_ns, entry.terminal_ns) {
+                        (Some(a), Some(b)) => a.min(b),
+                        (Some(a), None) | (None, Some(a)) => a,
+                        (None, None) => return None,
+                    };
+                    Some(nanos as f64 / entry.capacity as f64)
+                })
+                .reduce(f64::min)
+                .unwrap_or(COLD_PREFILL_NS_PER_TOKEN as f64);
+            for entry in &mut entries {
+                if entry.non_terminal_ns.is_none() || entry.terminal_ns.is_none() {
+                    let estimated = ((entry.capacity as f64) * ns_per_token)
+                        .round()
+                        .clamp(1.0, u64::MAX as f64) as u64;
+                    entry.non_terminal_ns.get_or_insert(estimated);
+                    entry.terminal_ns.get_or_insert(estimated);
+                }
+            }
+        }
+        entries
     }
 
     fn interval_prefill_ns(
@@ -436,7 +485,7 @@ impl RequestScheduler {
         let Some(prefill) = accounting.initial_prefill_ns else {
             return (accounting, true, false);
         };
-        let Some(copy_ns) = self.costs.fresh_duration(GraphKind::Snapshot, 1) else {
+        let Some(copy_ns) = self.snapshot_copy_cost_ns() else {
             return (accounting, true, false);
         };
         let mut unknown = false;
@@ -747,7 +796,7 @@ impl RequestScheduler {
         if capture.role == RetentionRole::Anchor {
             return Ok(true);
         }
-        if self.costs.fresh_duration(GraphKind::Snapshot, 1).is_none() {
+        if self.snapshot_copy_cost_ns().is_none() {
             return Ok(false);
         }
         let accounting = &self.request(handle)?.checkpoints;
@@ -808,7 +857,7 @@ impl RequestScheduler {
         let (mut accounting, _, _) = self.checkpoint_selection(request);
         accounting.cuts.clear();
         accounting.reserved_ns = 0;
-        let Some(cost) = self.costs.fresh_duration(GraphKind::Snapshot, 1) else {
+        let Some(cost) = self.snapshot_copy_cost_ns() else {
             self.stats.checkpoint_skip_unknown_cost += 1;
             return Ok(None);
         };
@@ -1695,5 +1744,106 @@ mod tests {
         );
         assert!(!partial_budget);
         assert_eq!(partial_selected.initial_prefill_ns, Some(150_000));
+    }
+
+    #[test]
+    fn cold_checkpoint_prior_enables_first_turn_extra_cuts_and_preserves_default_skip() {
+        // 1. Default (cold_checkpoint_prior = false): unmeasured costs skip extra cuts.
+        let mut disabled = super::super::tests::scheduler(1, 128, 16);
+        disabled
+            .graph_durations(&super::super::tests::duration_graphs(1))
+            .unwrap();
+        let mut spec = super::super::tests::spec(1024, 3);
+        spec.message_boundaries = vec![256, 512, 896];
+        let handle = disabled.admit(spec.clone()).unwrap();
+        let (cold, unknown, _) =
+            disabled.checkpoint_selection(disabled.request(handle).unwrap());
+        assert!(unknown);
+        assert_eq!(cold.initial_prefill_ns, None);
+        assert_eq!(
+            cold.cuts.iter().map(|cut| cut.endpoint).collect::<Vec<_>>(),
+            vec![896]
+        );
+        assert!(
+            !disabled
+                .checkpoint_copy_allowed(
+                    handle,
+                    ArmedCapture {
+                        snapshot: SnapshotId(0),
+                        endpoint: 512,
+                        role: RetentionRole::Message,
+                        copy_ns: COLD_SNAPSHOT_NS,
+                    }
+                )
+                .unwrap()
+        );
+        assert!(disabled.allocate_terminal_capture(handle).unwrap().is_none());
+
+        // 2. Enabled (cold_checkpoint_prior = true): completely cold engine uses 400 us/token
+        //    prefill prior and 500 us snapshot prior to capture shared prompt checkpoints on turn 1.
+        let mut enabled = super::super::tests::scheduler(1, 128, 16);
+        enabled
+            .graph_durations(&super::super::tests::duration_graphs(1))
+            .unwrap();
+        enabled
+            .configure_policy(PolicyConfig {
+                cold_checkpoint_prior: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let handle = enabled.admit(spec.clone()).unwrap();
+        let (cold_prior, unknown, budget) =
+            enabled.checkpoint_selection(enabled.request(handle).unwrap());
+        assert!(!unknown);
+        assert!(!budget);
+        assert_eq!(cold_prior.initial_prefill_ns, Some(1024 * COLD_PREFILL_NS_PER_TOKEN));
+        let endpoints: Vec<_> = cold_prior.cuts.iter().map(|cut| cut.endpoint).collect();
+        assert_eq!(endpoints, vec![256, 512, 896, 1024]);
+        for cut in &cold_prior.cuts {
+            if cut.role != RetentionRole::Anchor {
+                assert_eq!(cut.copy_ns, COLD_SNAPSHOT_NS);
+            }
+        }
+        enabled.request_mut(handle).unwrap().checkpoints = cold_prior;
+        assert!(
+            enabled
+                .checkpoint_copy_allowed(
+                    handle,
+                    ArmedCapture {
+                        snapshot: SnapshotId(0),
+                        endpoint: 256,
+                        role: RetentionRole::Message,
+                        copy_ns: COLD_SNAPSHOT_NS,
+                    }
+                )
+                .unwrap()
+        );
+        assert!(enabled.allocate_terminal_capture(handle).unwrap().is_some());
+
+        // 3. Enabled with partial prefill measurements: estimates unmeasured capacities from
+        //    the minimum measured per-token rate rather than the 400 us/token cold prior.
+        let mut partial = super::super::tests::scheduler(1, 128, 16);
+        partial
+            .graph_durations(&super::super::tests::duration_graphs(1))
+            .unwrap();
+        partial
+            .configure_policy(PolicyConfig {
+                cold_checkpoint_prior: true,
+                ..Default::default()
+            })
+            .unwrap();
+        // Capacity 512 measured at 100_000 ns/token; capacity 128 measured at 200_000 ns/token;
+        // capacity 256 unmeasured -> linearly estimated at min rate 100_000 ns/token = 25_600_000 ns.
+        measure(&mut partial, GraphKind::Prefill, 512, 51_200_000);
+        measure(&mut partial, GraphKind::Prefill, 128, 25_600_000);
+        let mut partial_spec = super::super::tests::spec(768, 3);
+        partial_spec.message_boundaries = vec![256, 512];
+        let handle = partial.admit(partial_spec).unwrap();
+        let (selected, unknown, _) =
+            partial.checkpoint_selection(partial.request(handle).unwrap());
+        assert!(!unknown);
+        // 768 tokens = 512 (51_200_000) + 256 (estimated 25_600_000) = 76_800_000 ns.
+        assert_eq!(selected.initial_prefill_ns, Some(76_800_000));
+        assert!(selected.cuts.iter().any(|cut| cut.endpoint == 256));
     }
 }

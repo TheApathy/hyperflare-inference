@@ -347,6 +347,15 @@ fn run() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     if let Some(fraction) = args.scheduler_checkpoint_extra_work_fraction {
         config["scheduler_checkpoint_extra_work_fraction"] = fraction.into();
     }
+    if args.scheduler_cold_checkpoint_prior {
+        config["scheduler_cold_checkpoint_prior"] = true.into();
+    }
+    if let Some(priority) = args.scheduler_prefill_priority {
+        config["scheduler_prefill_priority"] = priority.into();
+    }
+    if let Some(spec) = args.scheduler_spec_width_by_batch {
+        config["scheduler_spec_width_by_batch"] = spec.into();
+    }
     if let Some(name) = args.served_model_name {
         config["served_names"] = serde_json::json!([name]);
     }

@@ -5814,3 +5814,143 @@ fn cold_scored_prefill_checkpoint_cuts_and_atomic_spans_use_natural_fit_discover
     );
     assert_eq!(span_sched.request(h).unwrap().consumed_tokens, 20_000);
 }
+
+#[test]
+fn prefill_priority_rejects_invalid_values_and_elevates_prefill_over_decode() {
+    for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(
+            engine(1, false)
+                .configure_policy(PolicyConfig {
+                    prefill_priority: invalid,
+                    ..Default::default()
+                })
+                .is_err(),
+            "expected rejection for prefill_priority={invalid}"
+        );
+    }
+
+    let select_kind = |priority: f64| {
+        let mut s = engine(2, false);
+        let mut graphs = super::tests::duration_graphs(2);
+        for graph in &mut graphs {
+            if graph.kind == GraphKind::Prefill {
+                graph.estimated_duration_ns = 20 * MS;
+            } else if graph.kind == GraphKind::Decode {
+                graph.estimated_duration_ns = MS;
+            }
+        }
+        s.measured_graph_durations(&graphs).unwrap();
+        s.configure_policy(PolicyConfig {
+            prefill_priority: priority,
+            ..PolicyConfig::throughput()
+        })
+        .unwrap();
+        let decoder = add(&mut s, 1, 64, 16);
+        ready(&mut s, &[decoder]);
+        let waiting = add(&mut s, 2, 128, 16);
+        // Complete Init for `waiting` so both Prefill(128) and Decode(1) compete directly.
+        let init = s.phase_plan(GraphKind::Init, Some(waiting));
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&init, fence).unwrap();
+        let records = completion_records(&s, &init, fence, 0);
+        s.complete(fence, &records, gpu_time(MS)).unwrap();
+        s.plan().unwrap().kind
+    };
+
+    // At default priority 1.0, Decode(1) in 1 ms outbids Prefill(128) in 20 ms;
+    // multiplying prefill utility by 16.0 flips the choice to Prefill.
+    assert_eq!(select_kind(1.0), GraphKind::Decode);
+    assert_eq!(select_kind(16.0), GraphKind::Prefill);
+}
+
+#[test]
+fn spec_width_by_batch_filters_catalog_enforces_tight_batch_and_skips_acceptance_probe() {
+    // Rejects zero-width entries in PolicyConfig and fixed_speculative_widths_by_batch.
+    assert!(
+        engine(4, true)
+            .configure_policy(PolicyConfig {
+                speculative_width_by_batch: [Some(0), None, None, None, None, None, None],
+                ..Default::default()
+            })
+            .is_err()
+    );
+    assert!(
+        engine(4, true)
+            .fixed_speculative_widths_by_batch([None, Some(0), None, None, None, None, None])
+            .is_err()
+    );
+
+    // 1. Per-batch filtering in refresh_speculative_catalog and speculative_graphs,
+    //    plus fallback to adaptive widths when a configured width is absent from a bucket.
+    let mut sched = engine(4, true);
+    let schedule = speculation::parse_spec_width_by_batch("1:8,2:4,4:6").unwrap();
+    sched.fixed_speculative_widths_by_batch(schedule).unwrap();
+    assert_eq!(sched.speculative_catalog[0], vec![8]);
+    assert_eq!(sched.speculative_catalog[1], vec![4]);
+    // Width 6 is absent from engine's [1, 2, 4, 8] widths, so batch 4 stays adaptive.
+    assert_eq!(sched.speculative_catalog[2], vec![1, 2, 4, 8]);
+    assert_eq!(sched.batch_fixed_width(1), Some(8));
+    assert_eq!(sched.batch_fixed_width(2), Some(4));
+    assert_eq!(sched.batch_fixed_width(4), None);
+    assert!(!sched.all_batches_fixed_width());
+
+    // Speculative graphs preserve per-batch filtering after manifest narrowing.
+    sched
+        .speculative_graphs(&[
+            (1, 1), (1, 4), (1, 8),
+            (2, 1), (2, 4), (2, 8),
+            (4, 1), (4, 4),
+        ])
+        .unwrap();
+    assert_eq!(sched.speculative_catalog[0], vec![8]);
+    assert_eq!(sched.speculative_catalog[1], vec![4]);
+    assert_eq!(sched.speculative_catalog[2], vec![1, 4]);
+
+    // 2. Tight-batch guard prevents padding a single request up to a faster larger batch,
+    //    and all_batches_fixed_width() skips acceptance_probe even with full acceptance credit.
+    let mut guarded = engine(2, true);
+    let all_fixed = speculation::parse_spec_width_by_batch("1:8,2:4").unwrap();
+    guarded
+        .configure_policy(PolicyConfig {
+            speculative_width_by_batch: all_fixed,
+            ..PolicyConfig::throughput()
+        })
+        .unwrap();
+    assert!(guarded.all_batches_fixed_width());
+    // Give batch 2 width 4 a much faster duration than batch 1 width 8: without the
+    // tight-batch guard, a single decode request would be padded into batch 2 width 4.
+    let mut graphs = super::tests::duration_graphs(2);
+    for graph in &mut graphs {
+        if graph.kind == GraphKind::Speculative {
+            graph.estimated_duration_ns = if graph.batch_capacity == 1 {
+                20 * MS
+            } else {
+                2 * MS
+            };
+        }
+    }
+    guarded.measured_graph_durations(&graphs).unwrap();
+    let first = add(&mut guarded, 1, 64, 32);
+    ready(&mut guarded, &[first]);
+    guarded.refresh.acceptance_credit_ns = refresh::CREDIT_CAP_NS;
+
+    let single = guarded.plan().unwrap();
+    assert_eq!(single.kind, GraphKind::Speculative);
+    assert_eq!(single.batch_capacity, 1);
+    assert_eq!(single.token_capacity, 8);
+    assert_eq!(single.origin, PlanOrigin::Ordinary);
+
+    // Committing a synthetic AcceptanceStart while all batches are fixed is rejected.
+    let mut probe = single.clone();
+    probe.origin = PlanOrigin::AcceptanceStart;
+    assert!(guarded.commit(&probe, Fence(guarded.submitted.0 + 1)).is_err());
+
+    // With two eligible decode requests (target_batch = 2), batch 2 width 4 is selected.
+    let second = add(&mut guarded, 2, 64, 32);
+    ready(&mut guarded, &[second]);
+    let pair = guarded.plan().unwrap();
+    assert_eq!(pair.kind, GraphKind::Speculative);
+    assert_eq!(pair.batch_capacity, 2);
+    assert_eq!(pair.token_capacity, 4);
+    assert_eq!(pair.lanes.len(), 2);
+}

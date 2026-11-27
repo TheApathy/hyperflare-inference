@@ -531,6 +531,9 @@ impl OrbitPush {
             scheduler_terminal_value: None,
             scheduler_terminal_age_price: None,
             scheduler_checkpoint_extra_work_fraction: None,
+            scheduler_cold_checkpoint_prior: false,
+            scheduler_prefill_priority: None,
+            scheduler_spec_width_by_batch: None,
             bypass_performance_check: false,
             serving: self.serving.clone(),
         }
@@ -638,6 +641,19 @@ pub struct OrbitRun {
     #[arg(long, value_name = "FRACTION", value_parser = checkpoint_extra_work_fraction, help_heading = "Serving options")]
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
 
+    /// Estimate unmeasured prefill and snapshot durations with cold-start priors so extra
+    /// prefix checkpoints can be captured on the first request.
+    #[arg(long, help_heading = "Serving options")]
+    pub scheduler_cold_checkpoint_prior: bool,
+
+    /// Multiplier applied to prefill utility relative to decode [default: 1.0].
+    #[arg(long, value_name = "FLOAT", value_parser = prefill_priority, help_heading = "Serving options")]
+    pub scheduler_prefill_priority: Option<f64>,
+
+    /// Per-batch fixed speculative verification width schedule (comma-separated BATCH:WIDTH, e.g. 1:8,2:6,4:5,8:5).
+    #[arg(long, value_name = "SPEC", value_parser = spec_width_by_batch, help_heading = "Serving options")]
+    pub scheduler_spec_width_by_batch: Option<String>,
+
     /// File on rank zero's node containing the serving API key; overrides its [server].api_key.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
@@ -686,6 +702,15 @@ impl OrbitRun {
         if let Some(fraction) = self.scheduler_checkpoint_extra_work_fraction {
             options.extend(["--scheduler-checkpoint-extra-work-fraction".into(), fraction.to_string()]);
         }
+        if self.scheduler_cold_checkpoint_prior {
+            options.push("--scheduler-cold-checkpoint-prior".into());
+        }
+        if let Some(priority) = self.scheduler_prefill_priority {
+            options.extend(["--scheduler-prefill-priority".into(), priority.to_string()]);
+        }
+        if let Some(spec) = &self.scheduler_spec_width_by_batch {
+            options.extend(["--scheduler-spec-width-by-batch".into(), spec.clone()]);
+        }
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
         }
@@ -716,6 +741,9 @@ impl OrbitRun {
             scheduler_terminal_value: self.scheduler_terminal_value,
             scheduler_terminal_age_price: self.scheduler_terminal_age_price,
             scheduler_checkpoint_extra_work_fraction: self.scheduler_checkpoint_extra_work_fraction,
+            scheduler_cold_checkpoint_prior: self.scheduler_cold_checkpoint_prior,
+            scheduler_prefill_priority: self.scheduler_prefill_priority,
+            scheduler_spec_width_by_batch: self.scheduler_spec_width_by_batch.clone(),
             bypass_performance_check: false,
             serving: self.serving.clone(),
         }
@@ -842,6 +870,19 @@ pub struct Run {
     /// Terminal checkpoints also earn allowance from completed decode work.
     #[arg(long, value_name = "FRACTION", value_parser = checkpoint_extra_work_fraction, help_heading = "Serving options")]
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
+
+    /// Estimate unmeasured prefill and snapshot durations with cold-start priors so extra
+    /// prefix checkpoints can be captured on the first request.
+    #[arg(long, help_heading = "Serving options")]
+    pub scheduler_cold_checkpoint_prior: bool,
+
+    /// Multiplier applied to prefill utility relative to decode [default: 1.0].
+    #[arg(long, value_name = "FLOAT", value_parser = prefill_priority, help_heading = "Serving options")]
+    pub scheduler_prefill_priority: Option<f64>,
+
+    /// Per-batch fixed speculative verification width schedule (comma-separated BATCH:WIDTH, e.g. 1:8,2:6,4:5,8:5).
+    #[arg(long, value_name = "SPEC", value_parser = spec_width_by_batch, help_heading = "Serving options")]
+    pub scheduler_spec_width_by_batch: Option<String>,
 
     /// Skip Linux PCIe TP>1 host performance checks (NVIDIA driver params and IOMMU) after GPU init.
     #[arg(long, help_heading = "Serving options")]
@@ -1079,6 +1120,20 @@ fn checkpoint_extra_work_fraction(value: &str) -> Result<f64, String> {
     value.parse::<f64>().ok()
         .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
         .ok_or_else(|| "checkpoint extra work fraction must be finite and between zero and one".into())
+}
+
+fn prefill_priority(value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "prefill priority must be finite and greater than zero".into())
+}
+
+fn spec_width_by_batch(value: &str) -> Result<String, String> {
+    flare_helios::scheduler::speculation::parse_spec_width_by_batch(value)
+        .map(|_| value.to_owned())
+        .map_err(|error| error.to_string())
 }
 
 fn verification_alpha(value: &str) -> Result<f64, String> {
@@ -1358,6 +1413,116 @@ mod tests {
         for value in ["0", "0.05", "1"] {
             assert!(Cli::try_parse_from(["flare", "run", "model", "--scheduler-checkpoint-extra-work-fraction", value]).is_ok());
         }
+    }
+
+    #[test]
+    fn agent_scheduler_flags_parse_validate_and_forward_through_orbit() {
+        let defaults = run(&["flare", "run", "model"]);
+        assert!(!defaults.scheduler_cold_checkpoint_prior);
+        assert_eq!(defaults.scheduler_prefill_priority, None);
+        assert_eq!(defaults.scheduler_spec_width_by_batch, None);
+
+        let configured = run(&[
+            "flare",
+            "run",
+            "model",
+            "--scheduler-cold-checkpoint-prior",
+            "--scheduler-prefill-priority",
+            "16.0",
+            "--scheduler-spec-width-by-batch",
+            "1:8,2:6,4:5,8:5",
+        ]);
+        assert!(configured.scheduler_cold_checkpoint_prior);
+        assert_eq!(configured.scheduler_prefill_priority, Some(16.0));
+        assert_eq!(
+            configured.scheduler_spec_width_by_batch.as_deref(),
+            Some("1:8,2:6,4:5,8:5")
+        );
+
+        for invalid in ["0", "-1", "NaN", "inf", "-inf", "abc"] {
+            assert!(
+                Cli::try_parse_from([
+                    "flare",
+                    "run",
+                    "model",
+                    &format!("--scheduler-prefill-priority={invalid}")
+                ])
+                .is_err(),
+                "run prefill_priority={invalid}"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "flare",
+                    "orbit",
+                    "run",
+                    "model",
+                    &format!("--scheduler-prefill-priority={invalid}")
+                ])
+                .is_err(),
+                "orbit prefill_priority={invalid}"
+            );
+        }
+        for invalid in ["", "3:4", "1:0", "1:8,1:4", "128:2", "1:2:3", "1:8,"] {
+            assert!(
+                Cli::try_parse_from([
+                    "flare",
+                    "run",
+                    "model",
+                    &format!("--scheduler-spec-width-by-batch={invalid}")
+                ])
+                .is_err(),
+                "run spec={invalid}"
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "flare",
+                    "orbit",
+                    "run",
+                    "model",
+                    &format!("--scheduler-spec-width-by-batch={invalid}")
+                ])
+                .is_err(),
+                "orbit spec={invalid}"
+            );
+        }
+
+        // Orbit rank_zero_options and run_args forward all three flags cleanly.
+        let Command::Orbit(orbit_cmd) = Cli::try_parse_from([
+            "flare",
+            "orbit",
+            "run",
+            "model",
+            "--scheduler-cold-checkpoint-prior",
+            "--scheduler-prefill-priority",
+            "8.5",
+            "--scheduler-spec-width-by-batch",
+            "1:8,2:6",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        let OrbitCommand::Run(orbit) = orbit_cmd.command else {
+            panic!()
+        };
+        assert!(orbit.run_args().scheduler_cold_checkpoint_prior);
+        assert_eq!(orbit.run_args().scheduler_prefill_priority, Some(8.5));
+        assert_eq!(
+            orbit.run_args().scheduler_spec_width_by_batch.as_deref(),
+            Some("1:8,2:6")
+        );
+        let mut forwarded = vec!["flare".to_string(), "run".into(), "model".into()];
+        forwarded.extend(orbit.rank_zero_options());
+        let Command::Run(effective) = Cli::try_parse_from(forwarded).unwrap().command else {
+            panic!()
+        };
+        assert!(effective.scheduler_cold_checkpoint_prior);
+        assert_eq!(effective.scheduler_prefill_priority, Some(8.5));
+        assert_eq!(
+            effective.scheduler_spec_width_by_batch.as_deref(),
+            Some("1:8,2:6")
+        );
     }
 
     #[test]

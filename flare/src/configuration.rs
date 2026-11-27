@@ -16,11 +16,20 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 #[serde(default)]
 pub struct Configuration {
     pub server: Server,
+    pub scheduler: Scheduler,
     pub defaults: Model,
     pub models: HashMap<String, Model>,
     pub memory: Memory,
     pub prefix_cache: PrefixCache,
     pub paths: Paths,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Scheduler {
+    pub cold_checkpoint_prior: Option<bool>,
+    pub prefill_priority: Option<f64>,
+    pub spec_width_by_batch: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -81,6 +90,17 @@ impl Configuration {
         if configuration.server.scheduler_checkpoint_extra_work_fraction.is_some_and(|value|
             !value.is_finite() || !(0.0..=1.0).contains(&value)) {
             return Err("server.scheduler_checkpoint_extra_work_fraction must be finite and between zero and one".into());
+        }
+        if configuration
+            .scheduler
+            .prefill_priority
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err("scheduler.prefill_priority must be finite and greater than zero".into());
+        }
+        if let Some(spec) = configuration.scheduler.spec_width_by_batch.as_deref() {
+            flare_helios::scheduler::speculation::parse_spec_width_by_batch(spec)
+                .map_err(|error| format!("scheduler.spec_width_by_batch: {error}"))?;
         }
         size(configuration.memory.reserve.as_deref(), "memory.reserve")?;
         size(

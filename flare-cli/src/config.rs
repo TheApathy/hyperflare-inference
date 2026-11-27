@@ -70,6 +70,16 @@ impl Configuration {
                 if run.scheduler_checkpoint_extra_work_fraction.is_none() {
                     run.scheduler_checkpoint_extra_work_fraction = self.server.scheduler_checkpoint_extra_work_fraction;
                 }
+                if !run.scheduler_cold_checkpoint_prior {
+                    run.scheduler_cold_checkpoint_prior =
+                        self.scheduler.cold_checkpoint_prior.unwrap_or(false);
+                }
+                if run.scheduler_prefill_priority.is_none() {
+                    run.scheduler_prefill_priority = self.scheduler.prefill_priority;
+                }
+                if run.scheduler_spec_width_by_batch.is_none() {
+                    run.scheduler_spec_width_by_batch = self.scheduler.spec_width_by_batch.clone();
+                }
                 let serving = &mut run.serving;
                 if serving.memory_limit.is_none() {
                     serving.memory_limit = size(self.memory.reserve.as_deref(), "memory.reserve")?
@@ -213,6 +223,70 @@ mod tests {
         for invalid in ["-0.01", "1.01", "nan", "inf", "'0.05'", "true"] {
             let text = format!("[server]\nscheduler_checkpoint_extra_work_fraction={invalid}");
             assert!(Configuration::parse(&text).is_err());
+        }
+    }
+
+    #[test]
+    fn scheduler_config_section_and_flag_precedence() {
+        let base = ["flare", "run", "model.safetensors"];
+        let (_, empty) = configured("", &base, &[]);
+        assert!(!empty.scheduler_cold_checkpoint_prior);
+        assert_eq!(empty.scheduler_prefill_priority, None);
+        assert_eq!(empty.scheduler_spec_width_by_batch, None);
+
+        let text = "[scheduler]\ncold_checkpoint_prior = true\nprefill_priority = 16.0\nspec_width_by_batch = '1:8,2:6,4:5,8:5'\n";
+        let (_, from_config) = configured(text, &base, &[]);
+        assert!(from_config.scheduler_cold_checkpoint_prior);
+        assert_eq!(from_config.scheduler_prefill_priority, Some(16.0));
+        assert_eq!(
+            from_config.scheduler_spec_width_by_batch.as_deref(),
+            Some("1:8,2:6,4:5,8:5")
+        );
+
+        let (_, overridden) = configured(
+            text,
+            &[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--scheduler-prefill-priority",
+                "1.0",
+                "--scheduler-spec-width-by-batch",
+                "1:4",
+            ],
+            &[],
+        );
+        assert!(overridden.scheduler_cold_checkpoint_prior);
+        assert_eq!(overridden.scheduler_prefill_priority, Some(1.0));
+        assert_eq!(
+            overridden.scheduler_spec_width_by_batch.as_deref(),
+            Some("1:4")
+        );
+
+        let (_, flag_over_false) = configured(
+            "[scheduler]\ncold_checkpoint_prior = false\n",
+            &[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--scheduler-cold-checkpoint-prior",
+            ],
+            &[],
+        );
+        assert!(flag_over_false.scheduler_cold_checkpoint_prior);
+
+        for invalid in [
+            "[scheduler]\ncold_checkpoint_prior = 'true'\n",
+            "[scheduler]\nprefill_priority = 0\n",
+            "[scheduler]\nprefill_priority = -1.5\n",
+            "[scheduler]\nprefill_priority = nan\n",
+            "[scheduler]\nprefill_priority = inf\n",
+            "[scheduler]\nspec_width_by_batch = ''\n",
+            "[scheduler]\nspec_width_by_batch = '3:4'\n",
+            "[scheduler]\nspec_width_by_batch = '1:0'\n",
+            "[scheduler]\nspec_width_by_batch = '1:8,1:4'\n",
+        ] {
+            assert!(Configuration::parse(invalid).is_err(), "{invalid}");
         }
     }
 

@@ -29,6 +29,9 @@ pub struct Settings {
     pub publisher_keys: Vec<PathBuf>,
     pub thinking_token_budget: Option<u32>,
     pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
+    pub scheduler_cold_checkpoint_prior: Option<bool>,
+    pub scheduler_prefill_priority: Option<f64>,
+    pub scheduler_spec_width_by_batch: Option<String>,
     pub prefix_cache: PrefixCacheOffload,
     pub model_concurrency: std::collections::HashMap<String, usize>,
 }
@@ -69,6 +72,38 @@ mod tests {
             let configuration = Configuration::parse(&text).unwrap();
             let settings = Settings::resolve(configuration, Path::new("user"), Path::new("config.toml")).unwrap();
             assert_eq!(settings.scheduler_checkpoint_extra_work_fraction, fraction);
+        }
+    }
+
+    #[test]
+    fn scheduler_section_options_reach_application_settings() {
+        let empty = Configuration::parse("").unwrap();
+        let defaults = Settings::resolve(empty, Path::new("user"), Path::new("config.toml")).unwrap();
+        assert_eq!(defaults.scheduler_cold_checkpoint_prior, None);
+        assert_eq!(defaults.scheduler_prefill_priority, None);
+        assert_eq!(defaults.scheduler_spec_width_by_batch, None);
+
+        let configured = Configuration::parse(
+            "[scheduler]\ncold_checkpoint_prior = true\nprefill_priority = 16.0\nspec_width_by_batch = '1:8,2:6,4:5,8:5'\n",
+        )
+        .unwrap();
+        let settings = Settings::resolve(configured, Path::new("user"), Path::new("config.toml")).unwrap();
+        assert_eq!(settings.scheduler_cold_checkpoint_prior, Some(true));
+        assert_eq!(settings.scheduler_prefill_priority, Some(16.0));
+        assert_eq!(settings.scheduler_spec_width_by_batch.as_deref(), Some("1:8,2:6,4:5,8:5"));
+
+        for invalid in [
+            "[scheduler]\nprefill_priority = 0.0\n",
+            "[scheduler]\nprefill_priority = -2.0\n",
+            "[scheduler]\nprefill_priority = nan\n",
+            "[scheduler]\nprefill_priority = inf\n",
+            "[scheduler]\nspec_width_by_batch = ''\n",
+            "[scheduler]\nspec_width_by_batch = '3:4'\n",
+            "[scheduler]\nspec_width_by_batch = '1:0'\n",
+            "[scheduler]\nspec_width_by_batch = '1:8,1:4'\n",
+            "[scheduler]\nunknown_key = true\n",
+        ] {
+            assert!(Configuration::parse(invalid).is_err(), "{invalid}");
         }
     }
 
@@ -207,6 +242,9 @@ impl Settings {
             publisher_keys: Vec::new(),
             thinking_token_budget,
             scheduler_checkpoint_extra_work_fraction: configuration.server.scheduler_checkpoint_extra_work_fraction,
+            scheduler_cold_checkpoint_prior: configuration.scheduler.cold_checkpoint_prior,
+            scheduler_prefill_priority: configuration.scheduler.prefill_priority,
+            scheduler_spec_width_by_batch: configuration.scheduler.spec_width_by_batch,
             prefix_cache,
             model_concurrency,
         })

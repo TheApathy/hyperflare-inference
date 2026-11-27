@@ -23,6 +23,8 @@ _SECTIONS = {
     "publishing": {"signing_key": str, "namespace": str, "official_source": str},
     "server": {"host": str, "port": int, "api_key": str, "thinking_token_budget": int,
                "scheduler_checkpoint_extra_work_fraction": (int, float)},
+    "scheduler": {"cold_checkpoint_prior": bool, "prefill_priority": (int, float),
+                  "spec_width_by_batch": str},
     "defaults": {"model": str, "max_concurrency": int},
     "memory": {"reserve": str},
     "preparation": {"compile_workers": int, "autotune_effort": str, "checkpoint_token_file": str},
@@ -37,6 +39,9 @@ _BUILT_IN = {
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
     "server.thinking_token_budget": None,
     "server.scheduler_checkpoint_extra_work_fraction": 0.05,
+    "scheduler.cold_checkpoint_prior": False,
+    "scheduler.prefill_priority": 1.0,
+    "scheduler.spec_width_by_batch": "",
     "memory.reserve": "0",
     "preparation.compile_workers": 0,
     "preparation.autotune_effort": "default",
@@ -115,6 +120,25 @@ class Configuration:
                 raise UsageError(f"{path}: {key} in [{section}] must be {name}")
             if key == "scheduler_checkpoint_extra_work_fraction" and not (0 <= value <= 1 and math.isfinite(value)):
                 raise UsageError(f"{path}: {key} in [{section}] must be finite and between zero and one")
+            if key == "prefill_priority" and not (value > 0 and math.isfinite(value)):
+                raise UsageError(f"{path}: {key} in [{section}] must be finite and greater than zero")
+            if key == "spec_width_by_batch":
+                entries = [entry.strip() for entry in value.strip().split(",")]
+                if not value.strip() or any(not entry for entry in entries):
+                    raise UsageError(f"{path}: {key} in [{section}] must be a non-empty comma-separated list of BATCH:WIDTH pairs")
+                seen_batches = set()
+                for entry in entries:
+                    parts = entry.split(":")
+                    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                        raise UsageError(f"{path}: invalid {key} entry {entry!r} in [{section}]: expected BATCH:WIDTH")
+                    batch, width = int(parts[0]), int(parts[1])
+                    if batch not in (1, 2, 4, 8, 16, 32, 64):
+                        raise UsageError(f"{path}: batch {batch} in [{section}].{key} must be a power of two between 1 and 64")
+                    if width < 1:
+                        raise UsageError(f"{path}: width for batch {batch} in [{section}].{key} must be at least 1")
+                    if batch in seen_batches:
+                        raise UsageError(f"{path}: duplicate batch {batch} in [{section}].{key}")
+                    seen_batches.add(batch)
             if key in ("drain_on_shutdown", "max_age"):
                 text = value.strip()
                 if text in (("", "on", "off", "0") if key == "drain_on_shutdown" else ("", "off")):

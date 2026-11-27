@@ -23,6 +23,9 @@ pub struct PolicyConfig {
     pub estimate_ttl_ns: u64,
     pub adaptive_verification_alpha: f64,
     pub checkpoint_extra_work_fraction: f64,
+    pub cold_checkpoint_prior: bool,
+    pub prefill_priority: f64,
+    pub speculative_width_by_batch: [Option<usize>; 7],
 }
 
 impl Default for PolicyConfig {
@@ -38,6 +41,9 @@ impl Default for PolicyConfig {
             estimate_ttl_ns: 30_000_000_000,
             checkpoint_extra_work_fraction: 0.05,
             adaptive_verification_alpha: 1.0,
+            cold_checkpoint_prior: false,
+            prefill_priority: 1.0,
+            speculative_width_by_batch: [None; 7],
         }
     }
 }
@@ -211,6 +217,12 @@ impl RequestScheduler {
         if !policy.adaptive_verification_alpha.is_finite() || policy.adaptive_verification_alpha <= 0.0 {
             return Err("adaptive verification alpha must be finite and greater than zero".into());
         }
+        if !policy.prefill_priority.is_finite() || policy.prefill_priority <= 0.0 {
+            return Err("prefill priority must be finite and greater than zero".into());
+        }
+        if policy.speculative_width_by_batch.iter().flatten().any(|&w| w == 0) {
+            return Err("speculative width by batch entries must be at least 1".into());
+        }
         if !policy.output_token_value.is_finite()
             || policy.output_token_value <= 0.0
             || !policy.adaptation_ms.is_finite()
@@ -228,7 +240,12 @@ impl RequestScheduler {
         {
             return Err("invalid scheduler utility coefficients or estimation intervals".into());
         }
+        let batch_fixed_changed = policy.speculative_width_by_batch != self.speculative_batch_fixed;
         self.policy = policy;
+        self.speculative_batch_fixed = policy.speculative_width_by_batch;
+        if batch_fixed_changed && !self.speculative_widths.is_empty() {
+            self.refresh_speculative_catalog();
+        }
         self.costs.advance_to(self.now_ns, policy.estimate_ttl_ns);
         Ok(())
     }
@@ -440,6 +457,7 @@ impl RequestScheduler {
         let references = self.delivery_reference_intervals(&rates.map(|(_, d)| d));
         let mut scale = 0.0f64
             .max(self.policy.output_token_value.ln())
+            .max(self.policy.prefill_priority.ln())
             .max(self.policy.decode_age_price.ln())
             .max(self.policy.terminal_value.ln())
             .max(self.policy.terminal_age_price.ln());
@@ -500,6 +518,7 @@ impl RequestScheduler {
             value.prefill_token = unit + (token_log[slot] - scale).exp();
             value.output_token =
                 self.policy.output_token_value * unit + (token_log[slot] - scale).exp();
+            value.prefill_priority = self.policy.prefill_priority;
             value.delivery = (delivery_log[slot] - scale).exp();
             value.terminal *= unit;
             value.age_price *= unit;
@@ -1270,7 +1289,7 @@ impl RequestScheduler {
                 return self.available_plan(candidate, &values, age_price, log_scale, PlanOrigin::RefreshStart(target));
             }
         }
-        if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() {
+        if self.refresh.acceptance_ready() && !self.all_batches_fixed_width() {
             if let Some(candidate) = self.acceptance_probe(ordinary, &values, age_price) {
                 return self.available_plan(candidate, &values, age_price, log_scale, PlanOrigin::AcceptanceStart);
             }

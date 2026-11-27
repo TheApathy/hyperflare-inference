@@ -43,6 +43,73 @@ pub fn graph_catalog(widths: &[usize], fixed: Option<usize>, capacity: usize) ->
     } else { Vec::new() })
 }
 
+/// Parses a comma-separated `BATCH:WIDTH` schedule (for example `1:8,2:6,4:5,8:5`).
+///
+/// Each batch must belong to [`BATCH_CAPACITIES`] (powers of two from 1 through 64),
+/// each width must be at least 1, and duplicate batch entries are rejected.
+pub fn parse_spec_width_by_batch(spec: &str) -> Result<[Option<usize>; 7]> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "spec_width_by_batch must be a non-empty comma-separated list of BATCH:WIDTH pairs"
+                .into(),
+        );
+    }
+    let mut schedule = [None; 7];
+    for raw in trimmed.split(',') {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            return Err("spec_width_by_batch contains an empty entry".into());
+        }
+        let Some((batch_str, width_str)) = entry.split_once(':') else {
+            return Err(format!(
+                "invalid spec_width_by_batch entry '{entry}': expected BATCH:WIDTH"
+            )
+            .into());
+        };
+        if width_str.contains(':') {
+            return Err(format!(
+                "invalid spec_width_by_batch entry '{entry}': expected BATCH:WIDTH"
+            )
+            .into());
+        }
+        let batch = batch_str.parse::<usize>().map_err(|_| {
+            format!("invalid batch '{batch_str}' in spec_width_by_batch entry '{entry}'")
+        })?;
+        if !BATCH_CAPACITIES.contains(&batch) {
+            return Err(format!(
+                "batch {batch} in spec_width_by_batch must be a power of two between 1 and 64"
+            )
+            .into());
+        }
+        let width = width_str.parse::<usize>().map_err(|_| {
+            format!("invalid width '{width_str}' in spec_width_by_batch entry '{entry}'")
+        })?;
+        if width == 0 {
+            return Err(format!(
+                "width for batch {batch} in spec_width_by_batch must be at least 1"
+            )
+            .into());
+        }
+        let index = batch.trailing_zeros() as usize;
+        if schedule[index].is_some() {
+            return Err(format!("duplicate batch {batch} in spec_width_by_batch").into());
+        }
+        schedule[index] = Some(width);
+    }
+    Ok(schedule)
+}
+
+/// Formats a per-batch fixed speculative width schedule as `BATCH:WIDTH` pairs in batch order.
+pub fn format_spec_width_by_batch(schedule: &[Option<usize>; 7]) -> String {
+    BATCH_CAPACITIES
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, batch)| schedule[index].map(|width| format!("{batch}:{width}")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub fn validate_widths(widths: &[usize]) -> Result<()> {
     if !widths.is_empty()
         && (widths[0] != 1
@@ -266,5 +333,44 @@ fn acceptance_profiles_follow_core_capacity() {
         profile.observe(ProposalSource::Mtp, 0, capacity - 1, capacity - 1, false, None);
         assert_eq!(profile.rounds(), u64::from(capacity > 1));
         assert!(profile.prefix_probability(ProposalSource::Mtp, capacity - 1).is_none());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn parse_spec_width_by_batch_validates_format_batches_widths_and_duplicates() {
+    let parsed = parse_spec_width_by_batch("1:8,2:6,4:5,8:5").unwrap();
+    assert_eq!(parsed, [Some(8), Some(6), Some(5), Some(5), None, None, None]);
+    assert_eq!(format_spec_width_by_batch(&parsed), "1:8,2:6,4:5,8:5");
+
+    let spaced = parse_spec_width_by_batch(" 64:2 , 1:8 ").unwrap();
+    assert_eq!(spaced, [Some(8), None, None, None, None, None, Some(2)]);
+    assert_eq!(format_spec_width_by_batch(&spaced), "1:8,64:2");
+
+    for invalid in [
+        "",
+        "   ",
+        "1:8,",
+        ",1:8",
+        "1:8,,2:6",
+        "1",
+        "1:",
+        ":8",
+        "1:2:3",
+        "0:4",
+        "3:4",
+        "5:4",
+        "128:4",
+        "1:0",
+        "1:-2",
+        "abc:4",
+        "1:xyz",
+        "1:8,1:4",
+        "2:6,4:5,2:3",
+    ] {
+        assert!(
+            parse_spec_width_by_batch(invalid).is_err(),
+            "expected error for invalid schedule '{invalid}'"
+        );
     }
 }

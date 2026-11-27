@@ -2563,6 +2563,15 @@ impl Worker {
         if let Some(fraction) = self.settings.scheduler_checkpoint_extra_work_fraction {
             config["scheduler_checkpoint_extra_work_fraction"] = fraction.into();
         }
+        if let Some(enabled) = self.settings.scheduler_cold_checkpoint_prior {
+            config["scheduler_cold_checkpoint_prior"] = enabled.into();
+        }
+        if let Some(priority) = self.settings.scheduler_prefill_priority {
+            config["scheduler_prefill_priority"] = priority.into();
+        }
+        if let Some(spec) = &self.settings.scheduler_spec_width_by_batch {
+            config["scheduler_spec_width_by_batch"] = spec.clone().into();
+        }
         let mut loaded = match LoadedSession::new(owner, config) {
             Ok(loaded) => loaded,
             Err(error) => {

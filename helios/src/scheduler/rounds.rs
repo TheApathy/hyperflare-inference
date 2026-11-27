@@ -468,7 +468,9 @@ impl RequestScheduler {
     pub(super) fn round_lengths_optimistic(&self, mask: u64, batch: usize, drafts: usize, width: usize, packed: usize, optimistic: bool) -> [usize; REQUEST_LANES] {
         let ceilings = self.round_ceilings(mask, drafts, width);
         if self.gpu_prefix_allocation(batch, drafts, width, packed)
-            || self.speculative_fixed_width.is_some() || ceilings.iter().sum::<usize>() <= packed {
+            || self.batch_fixed_width(batch).is_some()
+            || ceilings.iter().sum::<usize>() <= packed
+        {
             return ceilings;
         }
         let (values, _, _) = self.lane_values(self.window_remaining().unwrap_or(0));
@@ -485,7 +487,7 @@ impl RequestScheduler {
         let mut lengths = [0; REQUEST_LANES];
         let ceiling = self.round_ceilings(mask, drafts, width);
         let gpu = self.gpu_prefix_allocation(batch, drafts, width, packed);
-        if (gpu && preserve_gpu_ceilings) || (!gpu && self.speculative_fixed_width.is_some())
+        if (gpu && preserve_gpu_ceilings) || (!gpu && self.batch_fixed_width(batch).is_some())
             || ceiling.iter().sum::<usize>() <= packed { return ceiling; }
         for slot in bits(mask) { lengths[slot] = 1; }
         let remaining = packed.saturating_sub(mask.count_ones() as usize);
@@ -560,7 +562,7 @@ impl RequestScheduler {
     }
 
     pub(super) fn speculative_duration(&self, request: &LiveRequest, batch: usize, width: usize) -> Option<u64> {
-        if self.speculative_fixed_width.is_none() {
+        if self.batch_fixed_width(batch).is_none() {
             // The full B x W graph is among the rounds this table minimizes over.
             return self.costs.packed_round_duration(batch, width);
         }
@@ -741,6 +743,16 @@ impl RequestScheduler {
             let request = entry.request.as_ref()?;
             (request.phase == RequestPhase::Decode && self.eligible(request)).then_some(slot)
         }).collect();
+        if available.is_empty() {
+            return;
+        }
+        let max_batch = self.limits.max_active.next_power_of_two();
+        let has_batch_fixed = self.speculative_fixed_width.is_none()
+            && crate::execution::BATCH_CAPACITIES
+                .into_iter()
+                .take_while(|&batch| batch <= max_batch)
+                .any(|batch| self.batch_fixed_width(batch).is_some());
+        let target_batch = available.len().next_power_of_two().min(max_batch);
         let mut forecasts = HashMap::new();
         let mut fixed_prefixes = HashMap::new();
         let mut host_rankings = HashMap::new();
@@ -749,9 +761,10 @@ impl RequestScheduler {
         let mut order = Vec::with_capacity(available.len());
         let mut frontier = std::collections::BinaryHeap::new();
         for shape in self.costs.packed_round_shapes() {
-            if shape.batch > self.limits.max_active.next_power_of_two()
+            if shape.batch > max_batch
+                || (has_batch_fixed && shape.batch > target_batch)
                 || !self.speculative_catalog[shape.batch.ilog2() as usize].contains(&shape.width) { continue; }
-            if self.speculative_fixed_width.is_some()
+            if self.batch_fixed_width(shape.batch).is_some()
                 && !self.gpu_prefix_allocation(shape.batch, shape.drafts, shape.width, shape.tokens) {
                 let prefixes = fixed_prefixes.entry((shape.drafts, shape.width)).or_insert_with(|| {
                     available.iter().map(|&slot| {

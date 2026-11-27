@@ -335,6 +335,24 @@ impl Bootstrap {
                 .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
                 .ok_or("scheduler_checkpoint_extra_work_fraction must be finite and between zero and one")?;
         }
+        if let Some(value) = object.get("scheduler_cold_checkpoint_prior") {
+            scheduling_policy.cold_checkpoint_prior = value
+                .as_bool()
+                .ok_or("scheduler_cold_checkpoint_prior must be a boolean")?;
+        }
+        if let Some(value) = object.get("scheduler_prefill_priority") {
+            scheduling_policy.prefill_priority = value
+                .as_f64()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .ok_or("scheduler_prefill_priority must be finite and greater than zero")?;
+        }
+        if let Some(value) = object.get("scheduler_spec_width_by_batch").filter(|v| !v.is_null()) {
+            let spec = value
+                .as_str()
+                .ok_or("scheduler_spec_width_by_batch must be a string")?;
+            scheduling_policy.speculative_width_by_batch =
+                crate::scheduler::speculation::parse_spec_width_by_batch(spec)?;
+        }
         if let Some(value) = object.get("mtp_adaptive_verification_alpha") {
             scheduling_policy.adaptive_verification_alpha = value.as_f64()
                 .filter(|v| v.is_finite() && *v > 0.0)
@@ -726,6 +744,47 @@ mod tests {
             assert_eq!(defaults.server.scheduling_policy.terminal_value, 256.0);
             assert_eq!(defaults.server.scheduling_policy.terminal_age_price, 1.0);
             assert_eq!(defaults.server.scheduling_policy.checkpoint_extra_work_fraction, 0.05);
+            assert!(!defaults.server.scheduling_policy.cold_checkpoint_prior);
+            assert_eq!(defaults.server.scheduling_policy.prefill_priority, 1.0);
+            assert_eq!(defaults.server.scheduling_policy.speculative_width_by_batch, [None; 7]);
+            for enabled in [false, true] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_cold_checkpoint_prior"] = enabled.into();
+                let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap();
+                assert_eq!(loaded.server.scheduling_policy.cold_checkpoint_prior, enabled);
+            }
+            for invalid in [json!(1), json!("true"), json!(null)] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_cold_checkpoint_prior"] = invalid;
+                assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap()
+                    .to_string().contains("scheduler_cold_checkpoint_prior"));
+            }
+            for priority in [0.5, 1.0, 16.0] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_prefill_priority"] = priority.into();
+                let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap();
+                assert_eq!(loaded.server.scheduling_policy.prefill_priority, priority);
+            }
+            for invalid in [json!(0.0), json!(-1.0), json!("16.0"), json!(null)] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_prefill_priority"] = invalid;
+                assert!(Bootstrap::load(&overrides.to_string(), &manifest).err().unwrap()
+                    .to_string().contains("scheduler_prefill_priority"));
+            }
+            {
+                let mut overrides = configured.clone();
+                overrides["scheduler_spec_width_by_batch"] = "1:8,2:6,4:5,8:5".into();
+                let loaded = Bootstrap::load(&overrides.to_string(), &manifest).unwrap();
+                assert_eq!(
+                    loaded.server.scheduling_policy.speculative_width_by_batch,
+                    [Some(8), Some(6), Some(5), Some(5), None, None, None]
+                );
+            }
+            for invalid in [json!(""), json!("3:4"), json!("1:0"), json!("1:8,1:4"), json!(123)] {
+                let mut overrides = configured.clone();
+                overrides["scheduler_spec_width_by_batch"] = invalid;
+                assert!(Bootstrap::load(&overrides.to_string(), &manifest).is_err());
+            }
             for fraction in [0.0, 0.05, 1.0] {
                 let mut overrides = configured.clone();
                 overrides["scheduler_checkpoint_extra_work_fraction"] = fraction.into();

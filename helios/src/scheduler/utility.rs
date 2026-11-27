@@ -74,10 +74,11 @@ impl ServicePrice {
 }
 
 /// Values share one positive scaling factor across all candidates in a plan.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct LaneValue {
     pub prefill_token: f64,
     pub output_token: f64,
+    pub prefill_priority: f64,
     pub delivery: f64,
     pub terminal: f64,
     pub age_price: f64,
@@ -85,9 +86,25 @@ pub(super) struct LaneValue {
     pub reference_delivery_ms: f64,
 }
 
+impl Default for LaneValue {
+    fn default() -> Self {
+        Self {
+            prefill_token: 0.0,
+            output_token: 0.0,
+            prefill_priority: 1.0,
+            delivery: 0.0,
+            terminal: 0.0,
+            age_price: 0.0,
+            age_ms: 0.0,
+            reference_delivery_ms: 0.0,
+        }
+    }
+}
+
 impl LaneValue {
     pub fn prefill(&self, consumed: usize, first_output: bool) -> f64 {
-        self.prefill_token * consumed as f64 + self.output_token * f64::from(first_output)
+        (self.prefill_token * consumed as f64 + self.output_token * f64::from(first_output))
+            * self.prefill_priority
     }
 
     pub fn decode(&self, expected_output: f64, duration_ms: f64) -> f64 {
@@ -355,10 +372,19 @@ mod tests {
             output_token: 64.0,
             ..Default::default()
         };
+        assert_eq!(value.prefill_priority, 1.0);
         assert_eq!(value.prefill(64, true), 128.0);
         let small = ValueRate::new(3_000_000, value.prefill(64, true), 0.0);
         let padded = ValueRate::new(66_000_000, value.prefill(64, true), 0.0);
         assert!(small.compare(padded).is_gt());
+
+        let boosted = LaneValue {
+            prefill_priority: 16.0,
+            ..value
+        };
+        assert_eq!(boosted.prefill(64, false), 16.0 * value.prefill(64, false));
+        assert_eq!(boosted.prefill(64, true), 16.0 * value.prefill(64, true));
+        assert_eq!(boosted.decode(4.0, 10.0), value.decode(4.0, 10.0));
     }
 
     #[test]

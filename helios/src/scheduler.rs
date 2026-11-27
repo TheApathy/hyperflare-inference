@@ -666,6 +666,7 @@ pub struct RequestScheduler {
     stats: SchedulerStats,
     speculative_widths: Vec<usize>,
     speculative_fixed_width: Option<usize>,
+    speculative_batch_fixed: [Option<usize>; 7],
     speculative_catalog: [Vec<usize>; 7],
     prefill_catalog: Vec<usize>,
     terminal_prefill_catalog: Vec<usize>,
@@ -762,6 +763,7 @@ impl RequestScheduler {
             stats: SchedulerStats::default(),
             speculative_widths: Vec::new(),
             speculative_fixed_width: None,
+            speculative_batch_fixed: [None; 7],
             speculative_catalog: Default::default(),
             prefill_catalog: prefill_capacities(limits.prefill_chunk_size).collect(),
             terminal_prefill_catalog: Vec::new(),
@@ -1020,12 +1022,60 @@ impl RequestScheduler {
         self.refresh_speculative_catalog();
         Ok(())
     }
+    pub fn fixed_speculative_widths_by_batch(&mut self, widths: [Option<usize>; 7]) -> Result<()> {
+        if self.submitted != Fence(0)
+            || !self.mixed_catalog.is_empty()
+            || self.slots.iter().any(|s| s.request.is_some())
+            || widths.iter().flatten().any(|&w| w == 0)
+        {
+            return Err(
+                "per-batch fixed speculative widths must be positive and configured before admission"
+                    .into(),
+            );
+        }
+        self.speculative_batch_fixed = widths;
+        self.policy.speculative_width_by_batch = widths;
+        self.refresh_speculative_catalog();
+        Ok(())
+    }
+    pub(super) fn batch_fixed_width(&self, batch: usize) -> Option<usize> {
+        if let Some(fixed) = self.speculative_fixed_width {
+            return Some(fixed);
+        }
+        if !batch.is_power_of_two() {
+            return None;
+        }
+        let idx = batch.trailing_zeros() as usize;
+        let fixed = self.speculative_batch_fixed.get(idx).copied().flatten()?;
+        self.speculative_catalog[idx]
+            .contains(&fixed)
+            .then_some(fixed)
+    }
+    pub(super) fn all_batches_fixed_width(&self) -> bool {
+        if self.speculative_fixed_width.is_some() {
+            return true;
+        }
+        let max_batch = self.limits.max_active.next_power_of_two();
+        crate::execution::BATCH_CAPACITIES
+            .into_iter()
+            .take_while(|&batch| batch <= max_batch)
+            .all(|batch| self.batch_fixed_width(batch).is_some())
+    }
     fn refresh_speculative_catalog(&mut self) {
         self.speculative_catalog = speculation::graph_catalog(
             &self.speculative_widths,
             self.speculative_fixed_width,
             self.limits.max_active.next_power_of_two(),
         );
+        if self.speculative_fixed_width.is_none() {
+            for (idx, widths) in self.speculative_catalog.iter_mut().enumerate() {
+                if let Some(fixed) = self.speculative_batch_fixed[idx]
+                    .filter(|fixed| widths.contains(fixed))
+                {
+                    widths.retain(|w| *w == fixed);
+                }
+            }
+        }
     }
     /// Restricts scheduling to graph shapes present in the loaded execution manifest.
     pub fn speculative_graphs(&mut self, shapes: &[(usize, usize)]) -> Result<()> {
@@ -1049,11 +1099,16 @@ impl RequestScheduler {
             }
             widths.push(width);
         }
-        for widths in
-            &mut catalog[..self.limits.max_active.next_power_of_two().ilog2() as usize + 1]
+        for (idx, widths) in catalog
+            [..self.limits.max_active.next_power_of_two().ilog2() as usize + 1]
+            .iter_mut()
+            .enumerate()
         {
             widths.sort_unstable();
-            if let Some(fixed) = self.speculative_fixed_width.filter(|fixed| widths.contains(fixed)) {
+            let fixed = self
+                .speculative_fixed_width
+                .or(self.speculative_batch_fixed[idx]);
+            if let Some(fixed) = fixed.filter(|fixed| widths.contains(fixed)) {
                 widths.retain(|w| *w == fixed);
             }
             if !self.speculative_widths.is_empty() && widths.is_empty() {
@@ -2413,8 +2468,10 @@ impl RequestScheduler {
         };
         self.refresh.validate(origin)?;
         if origin == PlanOrigin::AcceptanceStart
-            && (self.speculative_fixed_width.is_some() || step.token_capacity <= 1
-                || !matches!(step.kind, GraphKind::Speculative | GraphKind::Mixed)) {
+            && (self.all_batches_fixed_width()
+                || step.token_capacity <= 1
+                || !matches!(step.kind, GraphKind::Speculative | GraphKind::Mixed))
+        {
             return Err("acceptance learning requires an adaptive speculative choice".into());
         }
         if let PlanOrigin::RefreshStart(target) = origin {
